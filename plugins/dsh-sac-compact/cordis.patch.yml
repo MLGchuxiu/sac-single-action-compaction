@@ -1,0 +1,40 @@
+# Inserted by the @local/dsh-sac-compact bundle.
+#
+# Optimized defaults (2026-11-17, GLM-5.3-Inner @ 128K): paper-mode summarizer,
+# batch two actions per fold, keep the newest observation raw, trim only huge
+# observations, cap the recap at 400 words, drop the conversation prefix from
+# the state-update request, and force a fold when the surface approaches 96K
+# tokens (hard safety net under a 128K window).
+#
+# `statePrompt: inline` (v9) is still available, but reasoning models such as
+# GLM-5.3-Inner emit no text block before tool calls, so the plugin falls back
+# to paper after `inlineFallbackAfter` misses.
+- insert:
+    - id: sac-compact
+      name: '@local/dsh-sac-compact'
+      inject:
+        - systemPrompt
+        - tools
+        - llm
+      config:
+        enabled: true
+        actionsPerCompaction: 2
+        minSpanChars: 1200
+        minSpanTokens: 400
+        charsPerToken: 3.5
+        statePrompt: paper
+        stateMaxTokens: 2048
+        stateInputMaxChars: 0
+        stateBudget: 2048
+        adaptiveBudget: true
+        keepLastObservation: true
+        trimObservationOver: 4000
+        stateMaxWords: 400
+        stateInputLean: true
+        contextBudgetTokens: 96000
+        inlineFallbackAfter: 2
+        ledger: false
+        ledgerChars: 2400
+        ledgerFullCommands: true
+        recall: false
+        checklist: false

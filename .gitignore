@@ -1,0 +1,16 @@
+# heavy local artifacts - not published
+work/*
+!work/goal_round1/
+work/goal_round1/*
+!work/goal_round1/ITERATIONS.md
+runs/
+results/
+benchmarks/*
+!benchmarks/README.md
+
+# OS / Python cruft
+.DS_Store
+__pycache__/
+*.pyc
+.mc/
+node_modules/
