@@ -1,0 +1,23 @@
+{
+  "name": "@local/dsh-sac-compact",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Single-Action Compaction (SAC) context compression policy for the DeepSeek Harness — fold completed actions into a compact semantic state (arXiv:2611.05306). 1.1.0 adds the 128K-optimized paper pipeline (lean state updates, oversized-observation trim, recap word cap, hard context budget).",
+  "exports": {
+    ".": "./index.js",
+    "./policy": "./lib/sac-policy.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
