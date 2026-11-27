@@ -147,3 +147,33 @@ financial 按公司名 glob、legal 是 legal.json 的键。
 | tau2 数据 + 源码 | git partial clone（`--filter=blob:none`）+ jsdelivr CDN（`cdn/fastly.jsdelivr.net/gh/<repo>@v1.0.1/<path>`）+ GitHub contents API（.md 原件） |
 | Loong | git clone + 阿里云 OSS（国内直连，稳定） |
 | pyarrow（parquet→JSONL 转换） | 系统 Python + 清华 PyPI 镜像（DSH 自带 Python 受 macOS 签名限制不能加载 pyarrow） |
+
+---
+
+## 补充下载（2026-11-26）
+
+为按官方方式跑多轮仿真（[`docs/TEST-PLAN-TAU2-MULTITURN.md`](../docs/TEST-PLAN-TAU2-MULTITURN.md)）补齐了
+第一批没有下载的文件。全部取自同一个 tag **v1.0.1**（commit `fc0055d`），经 GitHub Git Blobs API 取原始字节，
+逐文件按 git blob SHA-1（`sha1("blob <len>\0" + 内容)`）校验：
+
+| 文件 | blob SHA-1（前 12 位） | 字节 |
+|---|---|---|
+| `data/tau2/user_simulator/simulation_guidelines.md` | `b55a28a1d5ea` | 1,449 |
+| `data/tau2/user_simulator/simulation_guidelines_tools.md` | `a7235b1ddf8d` | 2,747 |
+| `data/tau2/user_simulator/simulation_guidelines_voice.md` | `0fddef3ec6e1` | 6,540 |
+| `data/tau2/user_simulator/simulation_guidelines_voice_tools.md` | `344f00b6b368` | 7,912 |
+| `examples/agents/README.md` | `ceb30282daa7` | 1,938 |
+| `examples/agents/minimal_text_agent.py` | `620c510acec0` | 5,140 |
+| `examples/agents/custom_agent_eval.py` | `e9618432ec3b` | 5,963 |
+| `examples/agents/react_agent.py` | `52db1fed0bd2` | 7,818 |
+| `.env.example` | `7443177316f3` | 1,067 |
+| `.python-version` | `e4fba2183587` | 5 |
+| `uv.lock` | `09f0b4a86b4a` | 466,363 |
+
+其中真正影响官方运行的是 `data/tau2/user_simulator/simulation_guidelines.md` 和
+`simulation_guidelines_tools.md`：LLM 用户模拟器的 system prompt 由它们拼成，第一批只下了静态适配器用得到的部分，
+缺了它们官方的 `user_simulator` 无法运行。`examples/agents/` 是官方的自定义 agent 示例，`uv.lock` 是官方锁文件。
+
+官方跑法：在 `benchmarks/tau2-bench/` 里 `uv sync`（或 `pip install -e .`，Python 3.12–3.13），
+然后 `tau2 run --domain airline --agent llm_agent --agent-llm openai/gpt-4.1`。
+本仓库的准备好的环境在 `work/tau2/venv`（`pip install -e benchmarks/tau2-bench`，与 `uv.lock` 解析出的版本可能略有出入）。

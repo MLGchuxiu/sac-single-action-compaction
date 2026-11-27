@@ -8,11 +8,19 @@
 | | |
 |---|---|
 | 论文 | Belcak et al., *You don't need long context*, arXiv:2611.05306（本地副本：[paper.pdf](paper.pdf) / [paper.txt](paper.txt)，精读笔记：[docs/paper-notes.md](docs/paper-notes.md)） |
-| 插件 | [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md)（v1.1.0，48 个测试）+ [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md)（GUI 预设） |
+| 插件 | [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md)（v1.3.0，108 个测试）+ [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md)（GUI 预设，7 个测试） |
 | 测试台 | [`harness/`](harness/)：模型客户端、token 计量、工具沙箱、5 类任务、13 个状态模板版本 |
 | 基准 | Loong / SWE-bench Verified / τ²-bench（[benchmarks/](benchmarks/README.md)，均已下载校验），4 轮迭代 + 128K 优化线 |
 | 测试过的模型 | qwen3.7-flash、deepseek-v4.1-flash、GLM-5.3-Inner（即本地部署的 GLM 5.3） |
 | 硬约束 | 模型输入上限 **130,172** tokens，输出上限 **8,192** tokens（复现线口径） |
+
+## 最新版本 v1.3.0（2026-11-28）
+
+> 上一个发布版本是 v1.1.0。完整的改动、取证数字与升级方法见 [CHANGELOG.md](CHANGELOG.md)。
+
+- **v1.3.0 · 成本感知折叠**：折叠不再按动作数、而是按请求大小触发（出厂水位：整个请求超过「系统提示 + 工具定义 + 32K」才折，折到 + 16K）。**短对话一次都不折**，与不压缩时是同一组请求；长会话保持在水位附近。能由 harness 写的摘要行不再叫模型写，模型写的 recap 不再被截断或被拒。13 个真实长会话重放：token 21.9 亿 → 1.89 亿（−91%）；40 条记录的记忆测试 6/6 次全对（v1.2.0 在 qwen3.8-27b 上是 74/120 且重读全部文件）。[报告](reports/REPORT-SAC-PARETO.md)
+- **v1.2.0 · 多轮会话修复**：此前只有第一条用户消息是任务锚点，用户后面说的话会被折进摘要——「用户换了目标，代理仍围着头一个目标转」。现在每一条用户指令都钉在上下文里，只折叠指令之间的工作。[报告](reports/REPORT-SAC-MULTITURN.md)
+- **预设修复与离线更新包**：GUI 预设的配置补齐到与插件出厂配置逐键相同（此前预设会话一直跑的是旧行为），并有测试防止再次漂移；内网机器可用 GitHub Release 附件里的 `sac-deploy-kit-v1.3.0.zip` 离线更新 / 回滚。
 
 ---
 
@@ -91,7 +99,7 @@ SAC 赌的是一件事：**长程任务真正需要跨步骤携带的信息量�
 
 三件事，各自独立可用：
 
-1. **工程化**：[`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) —— 真实 DeepSeek Harness 插件。挂在 `agent/pre-step` 上，把 SAC 作为策略层叠加在已挂载的压缩后端之上，48 个单元/集成测试全绿。日常会话即装即用。
+1. **工程化**：[`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) —— 真实 DeepSeek Harness 插件。挂在 `agent/pre-step` 上，把 SAC 作为策略层叠加在已挂载的压缩后端之上，108 个单元/集成测试全绿（预设另有 7 个）。日常会话即装即用。
 2. **复现**：[`harness/`](harness/) —— 论文机制的逐字复现与消融实验台。硬预算 130,172 输入 / 8,192 输出 tokens；三种范式（FHA/EoCC/SAC）同台对比；13 个状态模板版本（v1–v13）的演化记录（v10–v13 为研究性扩展，其验证任务数据未公开）。
 3. **独立验证**：[`benchmarks/`](benchmarks/README.md) + [`reports/`](reports/BENCH-REPORT.md) —— 把插件放进真实 `dsh headless` 会话，在 Loong、SWE-bench Verified、τ²-bench 上与同模型 FHA 基线对比，共 4 轮迭代 + 一条 128K 优化线（12 任务 × n=5）。**全部数字可由仓库内脚本复现。**
 
@@ -117,12 +125,13 @@ agent/pre-step（每个模型请求前触发）
 
 ### 4.2 折叠范围规划 `planSacSpan()`（[lib/sac-policy.js](plugins/dsh-sac-compact/lib/sac-policy.js)）
 
-这是 SAC 的核心算法，一个**纯函数**——输入是会话表面的节点描述，输出是折叠范围或 `null`。不依赖 Cordis、会话或 LLM，因此可以脱离运行时做穷举单元测试。四条规则：
+这是 SAC 的核心算法，一个**纯函数**——输入是会话表面的节点描述，输出是折叠范围或 `null`。不依赖 Cordis、会话或 LLM，因此可以脱离运行时做穷举单元测试。五条规则：
 
-1. **任务锚点（task anchor）**：范围从「第一条非 checkpoint 的用户消息」**之后**开始。锚点之前的内容（system、任务本身）永不折叠。同时这意味着上一次折叠写入的状态消息会被**吸收**（absorb）——新状态是「旧状态 + 新动作」的归并，而不是两份状态的堆叠。
+1. **指令锚点（instruction anchors）**：每一条用户指令（`source.kind` 为 `user`，或 goal 插件的 `goal`）都是锚点，折叠范围落在两条指令**之间**——用户写下的话永远不会被折叠（v1.2.0 起；此前只有第一条用户消息是锚点）。system 与任务本身永不折叠。同时这意味着上一次折叠写入的状态消息会被**吸收**（absorb）——新状态是「旧状态 + 新动作」的归并，而不是两份状态的堆叠。
 2. **工具配对平衡切点（balanced cut）**：范围的右端只能落在「没有未应答工具调用」的边界上。扫描时维护 `openToolCalls` 计数（assistant 消息的每个 tool call +1，tool result −1），只有归零的位置才成为候选切点。**一条未收到回复的工具调用永远不会被折叠掉**——这是正确性的硬保证。
 3. **批量与保留**：`actionsPerCompaction` 控制每次折叠吸收几个完整动作（1 = 论文的严格 SAC，2 = 本项目基准上的最优配置 SAC-2）；`keepTrailingReply` 把不带工具调用的最终回复留在折叠范围外（用户可见的答案不进状态）；`keepLastObservation` 把最新一条观察留在原文（终结「折掉了→再读一遍」的循环，代价是峰值上下文略高）。
 4. **尺寸守卫与硬保险**：`minSpanChars` / `minSpanTokens`——状态重写本身要花几百 token，折叠太小的范围反而更大，直接跳过；`contextBudgetTokens`——整个会话表面逼近模型窗口（如 128K 配 96K）时**强制折叠**，作为配置失误的最后保险。
+5. **按代价触发（v1.3.0 起）**：出厂配置下，折叠由整个请求的大小触发——超过「固定提示 + 32K」才折，折到「固定提示 + 16K」为止，并要求一次模型 recap 至少能腾出它自身加 400 token 的空间。短对话因此一次都不折；把相关键归零即回到按动作数触发的 1.2.0 行为。
 
 ### 4.3 语义状态的生成：三种模式
 
@@ -169,6 +178,8 @@ dsh-sac-compact: folded 1 action(s) (seqs 12-15, ~812 tokens) into semantic stat
 5. **批量折叠与观察保留的工程平衡**。严格 SAC（每动作一折）在 SWE 上导致 4.8× 墙钟；`actionsPerCompaction: 2` + `keepLastObservation` 把墙钟降到 1.6×，同时总 token 仍比 FHA **−36%**、峰值 **−55%**。论文没有探讨这个频率-成本-延迟的权衡面。
 6. **128K 窗口的工程化四件套**（v1.1.0）：`stateInputLean`（状态更新请求不再重放 system prompt + 22 个工具 schema，实测每折省 ≈4.8K tokens）、`trimObservationOver`（只裁超大观察，短工具输出逐字保留）、`stateMaxWords`（recap 限长——它每个后续请求都要重发）、`contextBudgetTokens`（逼近窗口强制折叠）。合计：12 任务 × n=5，总 token **−58.6%**，峰值 **−61%**，加权得分还**略升**（§6.2）。
 7. **成本显式化**。论文承认附录 C 讨论 total token 未必下降，但没给「多付了多少次调用」的对照。本测试台显式记录 `requests / actions / compactions` 三个计数，把「为了短上下文付出的重复劳动」变成可量化指标（Loong 严格 SAC：token +44% 但峰值 6.7K vs 29.3K——这类权衡在报告里全部摆明）。
+8. **多轮会话里的指令保真**（v1.2.0）。论文的 SAC 假设一个会话一个任务；真实会话里用户会不断说话，v1.1.0 及之前后续消息会被折进摘要。v1.2.0 把每条用户指令钉在上下文里：τ²-bench 184 题上 521 条后续用户消息 100% 在每一个模型步都原样可见（旧版折掉 347 条），成功率与不压缩没有可分辨的差异（152 对 150）。
+9. **折叠的代价模型**（v1.3.0）。论文没有讨论「一次折叠划不划算」。逐次取证 820 次折叠后发现「每 2 个动作折一次」在十步的对话上是亏的：每次花约 4.2K token，换回中位 600 token 的上下文，24% 被拒、24% 被截断，对话最长的题上 27–29% 的工具调用是「折掉了再读一遍」。v1.3.0 改成按请求大小触发 + 收益门槛 + harness 写摘要行 + 限长且不截断的 recap：短对话与不压缩打平，长会话 token −67% 到 −91% 且记忆完整（[CHANGELOG](CHANGELOG.md#130--2026-11-28)）。
 
 ## 6. 验证结果
 
@@ -215,11 +226,24 @@ dsh-sac-compact: folded 1 action(s) (seqs 12-15, ~812 tokens) into semantic stat
 - **百万级输入**（992K tokens / 1,287 文件的编程任务）：所有范式都能用 **3–4K 上下文**解决——再次印证「长输入 ≠ 长上下文」；
 - **真实工作会话回放**（原始数据不在本仓库）：FHA/EoCC 均无法守住 130K 硬预算，**只有 SAC 全程不超限**；机器命令账本把状态保真度从 0.19 提升到 **0.90**。
 
+### 6.4 多轮会话与成本感知折叠（v1.2.0 / v1.3.0，2026-11-25 – 11-27）
+
+模型：τ² 用 qwen3.8-27b（思考模式），长程基准用 GLM-5.3-Inner；全部是真实 `dsh` 会话或官方 `tau2` 编排器。完整表格、读法与局限见 [CHANGELOG](CHANGELOG.md#130--2026-11-28) 与下列报告。
+
+| 场景 | 不压缩（FHA） | SAC 1.2.0 | SAC 1.3.0（出厂水位 32K） |
+|---|---|---|---|
+| τ²-bench 36 题子集（在线，1–4 个 trial） | 75.0%（108/144），峰值 prompt 38.3K | 账面 token 1.88×，27% 重复调用 | 108 个会话只折 2 次；token 0.94×；分数差在 A/A 噪声带内 |
+| 40 条记录的记忆测试（120 个事实 + 总额） | 120/120；3.28M token | qwen3.8-27b 上 74/120，重读全部文件 | **6/6 次 120/120**；1.08M（−67%）；0 次重复读取 |
+| 13 个真实长会话 / goal 会话（影子重放） | 21.9 亿 token | 1.19 亿 token，2,558 次模型 recap | **1.89 亿 token（−91%）**，503 次模型 recap |
+
+报告：[REPORT-SAC-PARETO.md](reports/REPORT-SAC-PARETO.md)（v1.3.0）；[REPORT-SAC-MULTITURN.md](reports/REPORT-SAC-MULTITURN.md) 与 [REPORT-TAU2-SAC120-MULTITURN.md](reports/REPORT-TAU2-SAC120-MULTITURN.md)（v1.2.0）。
+
 ## 7. 快速开始
 
 ```bash
-# 插件测试（48 个用例）
-cd plugins/dsh-sac-compact && node --test test/sac-policy.test.js test/integration.test.js
+# 插件单元 + 集成测试（108 个用例）；预设配置回归（7 个）
+cd plugins/dsh-sac-compact && node --test test/*.test.js
+cd ../dsh-sac-preset && node --test test/*.test.js
 
 # 单格测试
 python3 harness/run.py --models qwen3.7-flash --regimes sac --tasks code_edit --verbose
@@ -233,7 +257,7 @@ python3 harness/report.py results/iter1/*.jsonl --out reports/iter1.md
 cd harness && python3 -m bench.matrix --bench loong,tau2,swe --arms sac,fha --iteration iter0 --workers 6
 ```
 
-**在 GUI 里按工作区启用**：装 [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md)（独立预设，只在选定会话生效），新建会话时选「SAC 单动作压缩」即可，其它会话不受影响。验证方法：看会话日志出现 `compaction/start → compaction/summary → compaction/end` 与 `dsh-sac-compact: folded N action(s)` 行。
+**在 GUI 里按工作区启用**：装 [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md)（独立预设，只在选定会话生效），新建会话时选「SAC 单动作压缩」即可，其它会话不受影响。验证方法：看会话日志出现 `compaction/start → compaction/summary → compaction/end` 与 `dsh-sac-compact: folded N action(s)` 行（v1.3.0 起折叠按请求大小触发，短对话里看不到 `folded` 行是正常的）。预设组合在会话创建时固化：更新后要**完全退出并重启客户端，再新建会话**；其它机器用离线更新包（[CHANGELOG](CHANGELOG.md#130--2026-11-28)）。
 
 安装（profile 级）：
 
@@ -245,23 +269,27 @@ cd harness && python3 -m bench.matrix --bench loong,tau2,swe --arms sac,fha --it
 }
 ```
 
-128K 窗口推荐配置（就是当前默认值，实测即最优）：`statePrompt: paper` + `actionsPerCompaction: 2` + `keepLastObservation` + `trimObservationOver: 4000` + `stateMaxWords: 400` + `stateInputLean` + `contextBudgetTokens: 96000`。全部 22 个配置项说明见[插件 README](plugins/dsh-sac-compact/README.md#configuration)。
+出厂配置（v1.3.0）= 128K 调校 + 成本感知折叠。128K 调校（实测即最优，保持不变）：`statePrompt: paper` + `actionsPerCompaction: 2` + `keepLastObservation` + `trimObservationOver: 4000` + `stateMaxWords: 400` + `stateInputLean` + `contextBudgetTokens: 96000`。成本感知折叠：`foldTrigger: size`、`foldMarginTokens: 32000`（折到 16000）、`foldMinGainTokens: 400`、`recapMaxRatio: 0.6`、`mechanicalFoldMaxTokens: 4000`（只折已结束的轮次）。全部 47 个配置项说明见[插件 README](plugins/dsh-sac-compact/README.md#configuration)。
 
 ## 8. 仓库结构
 
 | 路径 | 内容 |
 |---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | **逐版本改动**：v1.2.0 多轮修复、v1.3.0 成本感知折叠，含取证数字、升级与回退方法 |
 | [`paper.pdf`](paper.pdf) / [`paper.txt`](paper.txt) | 论文原件与提取文本 |
-| [`plugins/dsh-sac-compact/`](plugins/dsh-sac-compact/README.md) | **SAC 插件**：策略层 + 状态管线 + 48 测试 |
-| [`plugins/dsh-sac-preset/`](plugins/dsh-sac-preset/README.md) | GUI Agent 预设（按会话启用 SAC） |
+| [`plugins/dsh-sac-compact/`](plugins/dsh-sac-compact/README.md) | **SAC 插件**：策略层 + 状态管线 + 108 测试 |
+| [`plugins/dsh-sac-preset/`](plugins/dsh-sac-preset/README.md) | GUI Agent 预设（按会话启用 SAC；7 个测试保证其配置与插件出厂配置一致） |
+| [`plugins/dsh-tau2-bridge/`](plugins/dsh-tau2-bridge/README.md) | τ²-bench 桥接插件：让 DSH + SAC 作为被测 agent 跑在官方编排器里 |
+| [`deploy/`](deploy/templates/README.md) / [`tools/`](tools/build_sac_deploy_kit.py) | 离线更新包（Windows / macOS）的模板、端到端回归与构建脚本 |
 | [`harness/sac/`](harness/sac/agent.py) | 复现测试台核心（agent 循环、prompts、任务、token 计量） |
 | [`harness/bench/`](harness/bench/runner.py) | 三基准适配器 + 并行矩阵运行器 |
+| [`harness/tau2/`](harness/tau2/) / [`harness/session_replay/`](harness/session_replay/README.md) | τ² 官方多轮测试台；用导出的会话日志离线重放折叠策略的工具 |
 | [`benchmarks/`](benchmarks/README.md) | 论文同款测试集（SWE-bench Verified 500 / τ²-bench 184 / LOONG 1,600） |
-| [`reports/`](reports/BENCH-REPORT.md) | 四轮基准报告 + 复现报告 + 128K 优化报告 |
-| [`docs/`](docs/paper-notes.md) | 论文精读 / 版本表 / 基准方法论 / 生态调研 |
+| [`reports/`](reports/BENCH-REPORT.md) | 四轮基准报告 + 复现报告 + 128K 优化报告 + 多轮取证 + 成本感知折叠（帕累托）报告 |
+| [`docs/`](docs/paper-notes.md) | 论文精读 / 版本表 / 基准方法论 / 生态调研 / τ² 多轮测试方案 |
 | [`work/`](work/goal_round1/ITERATIONS.md) | 128K 优化线逐轮数据 |
 
-版本命名注意：**插件线**（plugin-iter0–iter6 / plugin-v9）与**测试台线**（harness-v1–v13）是两条独立的线，看版本号前先对 [docs/VERSIONS.md](docs/VERSIONS.md)。
+版本命名注意：**插件线**（plugin-iter0–iter6 / plugin-v9）与**测试台线**（harness-v1–v13）是两条独立的线，看版本号前先对 [docs/VERSIONS.md](docs/VERSIONS.md)。发布版本号（1.1.0 / 1.2.0 / 1.3.0）的逐项改动见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 9. 局限
 
@@ -269,7 +297,11 @@ cd harness && python3 -m bench.matrix --bench loong,tau2,swe --arms sac,fha --it
 - 单个动作的观察本身超过窗口时，压缩救不了，需要配合观测裁剪类插件（如 `dsh-compaction-tool-result-pruner`）。
 - `inline` 模式在推理模型上不可用（tool-call 回复无文本块），已自动粘性回退 `paper`。
 - 严格 SAC 的墙钟代价（更多次、更小的请求）在 SWE 类任务上显著（4.8×），用 SAC-2 + `keepLastObservation` 可压到 1.6×，这是频率与延迟的权衡而非缺陷。
-- τ²-bench 采用静态单轮变体（非官方多轮编排分数）；SWE-bench 实例选用共享 venv 可跑的纯 Python 子集。方法与局限详见 [docs/bench-methodology.md](docs/bench-methodology.md)。
+- §6.1–6.3 的 τ²-bench 采用静态单轮变体（非官方多轮编排分数）；v1.2.0 起另有官方多轮编排器上的测试（§6.4）。SWE-bench 实例选用共享 venv 可跑的纯 Python 子集。方法与局限详见 [docs/bench-methodology.md](docs/bench-methodology.md)。
+- **多轮长会话上的一个已知边界**（v1.3.0）：回合中途的模型 recap 以当时的请求为锚，不保证带上之后新问题需要的每一个原始值；在「要带很多精确值的长任务」上摘要器有时会把累积的事实表换成计数，代理会重读自愈（80 条记录的测试 3 次里 1 次），代价是 token 接近不压缩。把已有的 `ledger` 接到 1.3.0 策略上是下一步。
+- `maxPinnedInstructions`（默认 4）不是硬上限：归档折叠要等旧指令大到值得一次模型调用才发生，τ² 的 184 个会话结束时 48 个钉着 5–9 条（保真不受影响，只是上下文比「最多 4 条」听起来大）。
+- v1.3.0 的分数结论只到「与不压缩的差在噪声带内」为止：τ² 子集 36 题、每臂 1–4 个 trial，SWE / LOONG 每格 1 次。
+- 离线更新包的 Windows 专属部分只通过了把平台模拟成 win32 的流程测试，没有在真机上测过；第一次在内网跑请先 `update-sac.cmd -check`。
 
 ## 10. 引用
 

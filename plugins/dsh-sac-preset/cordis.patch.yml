@@ -2,15 +2,22 @@
 # Single-Action Compaction policy (`@local/dsh-sac-compact`) mounted inside the
 # same isolated compaction group as `compaction-basic`.
 #
-# Sessions that select this preset get strict SAC (fold every completed action
-# into one semantic state). Sessions on any other preset never load it.
+# Sessions that select this preset run the SAC policy measured in
+# reports/REPORT-SAC-PARETO.md (cost-aware folding, plugin 1.3.0): nothing
+# folds on a short dialogue, a long session is folded once the request has
+# grown large enough for a fold to pay for itself. Sessions on any other
+# preset never load it.
+#
+# The `sac-compact` config below must stay identical, key for key, to the
+# config in ../dsh-sac-compact/cordis.patch.yml (the bundle's shipped policy):
+# test/preset-policy.test.js compares the two.
 - insert:
     - id: preset-sac
       name: '@deepseek-ai/dsh-agent-preset'
       config:
         id: sac
         name: SAC 单动作压缩
-        description: 每次动作后把交互折叠成一段语义状态（论文 arXiv:2611.05306），用于单动作压缩测试。
+        description: 请求变大后才折叠：短对话等同全量历史，长会话把已完成的工作折叠成一段语义状态（论文 arXiv:2611.05306；1.3.0 成本感知折叠）。
         order: 10
         plugins:
           - id: persona
@@ -101,11 +108,14 @@
                   - tools
                   - llm
                 config:
-                  # Optimized 2026-11-17 for GLM-5.3-Inner under a 128K window:
-                  # paper-mode recap (inline never fires on reasoning models),
-                  # batch 2 actions, keep the newest observation, trim huge
-                  # observations only, 400-word recap, lean state-update request,
-                  # and a 96K-token hard fold trigger as the window safety net.
+                  # Base keys, tuned 2026-11-17 for GLM-5.3-Inner under a 128K
+                  # window: paper-mode recap (inline never fires on reasoning
+                  # models), keep the newest observation, trim huge
+                  # observations only, 400-word recap, lean state-update
+                  # request, and a 96K-token hard fold trigger as the window
+                  # safety net. When they were written, the plugin also folded
+                  # after every 2 actions; since the cost-aware keys at the end
+                  # of this block, folding starts from the request size instead.
                   enabled: true
                   actionsPerCompaction: 2
                   minSpanChars: 1200
@@ -127,6 +137,73 @@
                   ledgerFullCommands: true
                   recall: false
                   checklist: false
+                  # Multi-turn (1.2.0): every user instruction stays on the
+                  # surface verbatim and only the work between instructions is
+                  # folded; the 4 most recent requests are kept, older ones are
+                  # quoted verbatim in the archive state. These are the defaults.
+                  pinInstructions: true
+                  instructionSourceKinds:
+                    - user
+                    - goal
+                  maxPinnedInstructions: 4
+                  instructionChars: 4000
+                  # Cost-aware folding (plugin 1.3.0, the shipped policy; identical
+                  # to ../dsh-sac-compact/cordis.patch.yml). Folding pays for itself
+                  # only on long sessions: on a ten-step dialogue a model-written
+                  # recap costs more than the context it frees, and folding often
+                  # makes the agent re-read what was folded
+                  # (reports/REPORT-SAC-PARETO.md). Hence:
+                  foldTrigger: size
+                  # …fold by the size of the whole request, not by action count,
+                  foldMarginTokens: 32000
+                  # …once it exceeds the fixed prompt (system prompt + tool
+                  # schemas) by about 32K tokens, and down to the fixed prompt +
+                  # about 16K (foldBelowTokens 0 = half the margin). One setting
+                  # then fits a 5K customer-service prompt and a 20K coding-agent
+                  # prompt. Lower it to 24000 or 12000 to trade more folds for a
+                  # smaller context.
+                  foldAboveTokens: 0
+                  foldBelowTokens: 0
+                  maxFoldsPerStep: 3
+                  foldMinGainTokens: 400
+                  # …a model recap only replaces a span at least the recap + 400
+                  # tokens …
+                  recapExpectedTokens: 0
+                  recapMaxRatio: 0.6
+                  # …and stays under 60% of that span (never "not smaller").
+                  mechanicalFoldMaxTokens: 4000
+                  mechanicalSegments: frozen
+                  mechanicalMinGainTokens: 80
+                  # Small digests are written by the harness (no model call), for
+                  # finished turns only: digesting the working state after every
+                  # step made the agent redo its work.
+                  digestResultChars: 2000
+                  digestReplyChars: 4000
+                  digestMaxChars: 3000
+                  digestShrinkToBudget: true
+                  # JSON results are compacted by structure, not cut. When a
+                  # finished turn holds more results than fit that budget, every
+                  # result takes a smaller share (its head) instead of the turn
+                  # being handed to the model.
+                  replyReasoningFoldChars: 1500
+                  # A final reply with heavy reasoning folds with its turn.
+                  stateMaxTokensThinking: 4096
+                  # A thinking agent's first recap starts from a 4,096 output cap.
+                  goalDedupe: true
+                  # Optional, not set here: stateProvider / stateModel, a
+                  # non-reasoning model that writes the recaps (about 5 s instead
+                  # of 20-70 s per fold).
+                  stateProvider: ''
+                  stateModel: ''
+                  stateMaxTokensCeiling: 8192
+                  standingSourceKinds:
+                    - agent-instructions
+                  #
+                  # 1.2.0 behaviour (fold after actionsPerCompaction actions), if
+                  # wanted: foldTrigger actions, foldMarginTokens 0,
+                  # foldMinGainTokens 0, recapMaxRatio 0, mechanicalFoldMaxTokens
+                  # 0, replyReasoningFoldChars 0, stateMaxTokensThinking 0,
+                  # digestResultChars 600, digestShrinkToBudget false.
           - id: delegation
             name: cordis:group
             group: true

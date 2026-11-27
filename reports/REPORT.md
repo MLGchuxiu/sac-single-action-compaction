@@ -343,4 +343,4 @@ python3 harness/report.py results/*/*.jsonl --out reports/all-tables.md
 ```
 
 **环境**：Python 3.12（标准库 + Pillow），Node 24（仅插件测试）。
-**密钥**：`SAC_API_KEY` 环境变量，或复用 `~/.dsh/.credentials.yaml` 的 `AIRONGCE_API_KEY`。
+**密钥**：`SAC_API_KEY` 环境变量，或 `OPENAI_API_KEY`。

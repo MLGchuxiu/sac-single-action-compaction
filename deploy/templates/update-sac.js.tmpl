@@ -1,0 +1,752 @@
+#!/usr/bin/env node
+// ============================================================================
+// update-sac.js - SAC (Single-Action Compaction) plugin for DeepSeek Harness:
+// offline install / update / check / rollback (Windows and macOS), kit __VERSION__.
+//
+// Launched by update-sac.cmd (Windows) or update-sac.sh (macOS), or directly:
+//   node update-sac.js [options]
+//
+// The plugin files are embedded below as base64, so this file works fully
+// offline: no npm, pnpm, python or network. Files are restored byte for byte
+// and verified by SHA-256. Before anything is replaced, the current state is
+// copied to <dsh-root>/sac-backups/, and a failed update rolls back by itself.
+//
+// Options (- or -- prefix both accepted):
+//   (none)                install, or update in place what is installed
+//   -check                report what is installed and what would change; change nothing
+//   -rollback [-backup D] undo an update from its backup (D: a specific backup)
+//   -uninstall [-purge]   remove SAC from the profile (-purge also deletes the plugin files)
+//   -profile <name>       target profile (default: desktop)
+//   -preset | -global     how SAC is mounted: as the agent preset "sac" (only sessions
+//                         that select it) or at profile level (every session).
+//                         Default: what the profile already does; on a fresh install
+//                         the preset when this client supports it, else global.
+//   -dsh-root <path>      the .dsh root (default: %DSH_HOME% or <home>/.dsh)
+//   -plugins-dir <path>   where the plugin files live (default: <dsh-root>/plugins/sac)
+//   -app-asar <path>      the client's resources/app.asar, to derive the preset from
+//   -no-adapt             do not look for app.asar; keep the installed preset's plugin list
+//   -yes                  no questions (required when stdin is not a terminal)
+//   -no-test              skip the plugin self-test
+//
+// Exit codes: 0 done | 1 bad arguments | 2 stopped (precondition, verification) |
+//             3 nothing to roll back | 4 installed but the self-test failed |
+//             10 -check: SAC is not up to date
+// ============================================================================
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+const readline = require('readline');
+const { execFileSync, spawnSync } = require('child_process');
+
+/** Kit metadata, filled in by tools/build_sac_deploy_kit.py. */
+const KIT = __KIT__;
+/** { "dsh-sac-compact/index.js": "<base64>", ... } */
+const FILES = __FILES__;
+
+__SHARED__
+
+const COMPACT = '@local/dsh-sac-compact';
+const PRESET = '@local/dsh-sac-preset';
+const DIR = { compact: 'dsh-sac-compact', preset: 'dsh-sac-preset' };
+const KINDS = ['compact', 'preset'];
+const EXIT = { OK: 0, USAGE: 1, STOPPED: 2, NOTHING: 3, TEST_FAILED: 4, UPDATE_AVAILABLE: 10 };
+
+// ---------- arguments ----------
+function printHelp() {
+  console.log([
+    'SAC deploy kit ' + KIT.version + ' (@local/dsh-sac-compact ' + KIT.compactVersion + ' + @local/dsh-sac-preset ' + KIT.presetVersion + ')',
+    '',
+    'Usage: node update-sac.js [-check | -rollback [-backup DIR] | -uninstall [-purge]]',
+    '                        [-profile NAME] [-preset | -global] [-dsh-root PATH] [-plugins-dir PATH]',
+    '                        [-app-asar PATH] [-no-adapt] [-yes] [-no-test]',
+    '',
+    '  (none)       install SAC, or update in place what this profile already has',
+    '  -check       report what is installed and what would change; change nothing',
+    '  -rollback    undo the last update from the backup it made (-backup DIR: a specific one)',
+    '  -uninstall   remove SAC from the profile (-purge also deletes the plugin files)',
+    '  -profile     target profile (default: desktop)',
+    '  -preset      mount as the agent preset "sac": only sessions that select it',
+    '  -global      mount at profile level: every session of the profile',
+    '  -yes         no questions (required when stdin is not a terminal)',
+    '',
+    'Exit codes: 0 done, 1 bad arguments, 2 stopped, 3 nothing to roll back,',
+    '            4 installed but self-test failed, 10 (-check) SAC is not up to date',
+  ].join('\n'));
+}
+function parseArgs(argv) {
+  const a = { profile: 'desktop', method: null, check: false, rollback: false, uninstall: false, purge: false, yes: false, test: true };
+  for (let i = 0; i < argv.length; i += 1) {
+    const k = String(argv[i]).replace(/^[-/]+/, '').toLowerCase();
+    const next = () => { if (i + 1 >= argv.length || String(argv[i + 1]) === '') fail(EXIT.USAGE, 'missing value for ' + argv[i]); return argv[++i]; };
+    if (k === 'profile' || k === 'profilename') a.profile = next();
+    else if (k === 'global') a.method = 'global';
+    else if (k === 'preset') a.method = 'preset';
+    else if (k === 'check' || k === 'status') a.check = true;
+    else if (k === 'rollback' || k === 'restore') a.rollback = true;
+    else if (k === 'backup') a.backup = next();
+    else if (k === 'uninstall') a.uninstall = true;
+    else if (k === 'purge') a.purge = true;
+    else if (k === 'yes' || k === 'y') a.yes = true;
+    else if (k === 'no-test' || k === 'notest') a.test = false;
+    else if (k === 'dshroot' || k === 'dsh-root') a.dshRoot = next();
+    else if (k === 'appasar' || k === 'app-asar') a.appAsar = next();
+    else if (k === 'no-adapt' || k === 'noadapt') a.noAdapt = true;
+    else if (k === 'pluginsdir' || k === 'plugins-dir') a.pluginsDir = next();
+    else if (k === 'help' || k === 'h' || k === '?') { printHelp(); process.exit(0); }
+    else fail(EXIT.USAGE, 'unknown argument: ' + argv[i] + ' (use -help)');
+  }
+  if ([a.check, a.rollback, a.uninstall].filter(Boolean).length > 1) fail(EXIT.USAGE, '-check, -rollback and -uninstall are separate operations');
+  if (a.backup && !a.rollback) fail(EXIT.USAGE, '-backup goes with -rollback');
+  return a;
+}
+
+// ---------- output ----------
+function say(m) { console.log('[SAC] ' + m); }
+function note(m) { console.log('       ' + m); }
+function warn(m) { console.log('[SAC] WARNING: ' + m); }
+function status(m) { console.log('STATUS ' + m); }
+function show(v) { return v === null || v === undefined ? 'unknown' : String(v); }
+/** Every exit goes through here. It never returns: a window opened by double-click stays open until Enter. */
+function finish(code) {
+  if (process.env.SAC_PAUSE === '1' && process.stdin.isTTY) {
+    try {
+      process.stdout.write('\n[SAC] Press Enter to close this window... ');
+      fs.readSync(0, Buffer.alloc(1), 0, 1);
+    } catch (e) {}
+  }
+  process.exit(code);
+}
+function fail(code, m) { console.error('[SAC] ERROR: ' + m); finish(code); }
+function stamp() {
+  const d = new Date(); const p = (x) => String(x).padStart(2, '0');
+  return '' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds());
+}
+function confirm(question) {
+  if (ARGS.yes) return Promise.resolve(true);
+  if (!process.stdin.isTTY) throw new Error('stdin is not a terminal: pass -yes to apply the changes, or -check to look only');
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(question + ' [y/N] ', (answer) => { rl.close(); resolve(/^y(es)?$/i.test(String(answer).trim())); });
+  });
+}
+
+// ---------- small filesystem helpers ----------
+function exists(p) { try { return fs.existsSync(p); } catch (e) { return false; } }
+function sha256(file) { return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex'); }
+function readText(file) { return fs.readFileSync(file, 'utf8'); }
+function writeJson(file, data) { fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n'); }
+function copyFile(src, dst) { fs.mkdirSync(path.dirname(dst), { recursive: true }); fs.copyFileSync(src, dst); }
+function toPosix(p) { return String(p).split(path.sep).join('/'); }
+/** Copy a directory tree (never node_modules); `record` collects { path, sha256 } of the copies. */
+function copyTree(src, dst, record) {
+  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    if (e.name === 'node_modules' || e.name === '.DS_Store') continue;
+    const from = path.join(src, e.name), to = path.join(dst, e.name);
+    if (e.isDirectory()) copyTree(from, to, record);
+    else if (e.isFile()) { copyFile(from, to); if (record) record.push({ path: to, sha256: sha256(to) }); }
+  }
+}
+function isRegularFile(p) { try { return fs.statSync(p).isFile(); } catch (e) { return false; } }
+function pkgField(dir, field) {
+  const file = path.join(dir, 'package.json');
+  const pkg = exists(file) ? safeJson(readText(file)) : null;
+  return pkg && pkg[field] !== undefined ? String(pkg[field]) : null;
+}
+function sacName(kind) { return kind === 'preset' ? PRESET : COMPACT; }
+function isSacDir(dir, kind) {
+  if (!exists(dir)) return false;
+  if (pkgField(dir, 'name') === sacName(kind)) return true;
+  try { return fs.readdirSync(dir).length === 0; } catch (e) { return false; }
+}
+/** `p` with symlinks resolved as far as they exist (a fresh install's directory does not exist yet). */
+function realish(p) {
+  try { return fs.realpathSync(p); } catch (e) {}
+  try { return path.join(fs.realpathSync(path.dirname(p)), path.basename(p)); } catch (e) { return path.resolve(p); }
+}
+function norm(p) { return path.resolve(String(p).replace(/^\\\\\?\\/, '')); }
+/** Windows paths are case-insensitive; a user may also spell a directory differently from the disk. */
+function samePath(a, b) {
+  const x = norm(realish(a)), y = norm(realish(b));
+  return process.platform === 'win32' ? x.toLowerCase() === y.toLowerCase() : x === y;
+}
+function inside(child, parent) {
+  const c = norm(realish(child)), p = norm(realish(parent));
+  const prefix = process.platform === 'win32' ? (c.toLowerCase().indexOf(p.toLowerCase()) === 0) : (c.indexOf(p) === 0);
+  return prefix && (c.length === p.length || c.charAt(p.length) === path.sep);
+}
+/** The path to record for a link: the one the profile already uses when it still points at the same directory. */
+function registeredTarget(existing, target) {
+  const m = existing ? /^link:(.+)$/.exec(String(existing)) : null;
+  if (m && exists(path.join(m[1], 'package.json'))) {
+    let real = null;
+    try { real = fs.realpathSync(m[1]); } catch (e) {}
+    if (real && samePath(real, target)) return m[1];
+  }
+  return target;
+}
+function linkInfo(p) {
+  let st = null;
+  try { st = fs.lstatSync(p); } catch (e) { return { exists: false }; }
+  const isLink = st.isSymbolicLink();
+  let target = null, real = null;
+  if (isLink) { try { target = fs.readlinkSync(p); } catch (e) {} }
+  try { real = fs.realpathSync(p); } catch (e) {}
+  return { exists: true, isLink, target, real, broken: !exists(path.join(p, 'package.json')), version: pkgField(p, 'version') };
+}
+
+const ARGS = parseArgs(process.argv.slice(2));
+const DSH_ROOT = ARGS.dshRoot || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+const PLUGINS_DIR = ARGS.pluginsDir || path.join(DSH_ROOT, 'plugins', 'sac');
+const PROFILE_DIR = path.join(DSH_ROOT, 'profiles', ARGS.profile);
+const PKG = path.join(PROFILE_DIR, 'package.json');
+const NM_LOCAL = path.join(PROFILE_DIR, 'node_modules', '@local');
+const BACKUP_ROOT = path.join(DSH_ROOT, 'sac-backups');
+const UNDO_ROOT = path.join(DSH_ROOT, 'sac-backups-undo');
+const PRESET_PATCH = 'cordis.patch.yml';
+
+/** The embedded files, with the hash each must have on disk. */
+const PAYLOAD = Object.keys(FILES).map((rel) => {
+  const data = Buffer.from(FILES[rel], 'base64');
+  return { rel, kind: rel.split('/')[0] === DIR.compact ? 'compact' : 'preset', inner: rel.slice(rel.indexOf('/') + 1),
+    sha: crypto.createHash('sha256').update(data).digest('hex'), data };
+});
+
+// ---------- what is installed now ----------
+function detectState() {
+  const pkg = exists(PKG) ? safeJson(readText(PKG)) : null;
+  const bundles = pkg ? ((pkg.dsh || {}).profile || {}).bundles || [] : [];
+  const deps = pkg ? pkg.dependencies || {} : {};
+  const hasPreset = bundles.indexOf(PRESET) >= 0 || Object.prototype.hasOwnProperty.call(deps, PRESET);
+  const hasCompact = bundles.indexOf(COMPACT) >= 0 || Object.prototype.hasOwnProperty.call(deps, COMPACT);
+  const link = { preset: linkInfo(path.join(NM_LOCAL, DIR.preset)), compact: linkInfo(path.join(NM_LOCAL, DIR.compact)) };
+  // The client loads the files through the node_modules links: those directories are the ones to update.
+  const dir = {};
+  dir.preset = link.preset.real && !link.preset.broken ? link.preset.real : path.join(PLUGINS_DIR, DIR.preset);
+  dir.compact = link.compact.real && !link.compact.broken ? link.compact.real : path.join(path.dirname(dir.preset), DIR.compact);
+  const fileDiffers = { preset: false, compact: false };
+  const installed = { preset: false, compact: false };
+  for (const item of PAYLOAD) {
+    if (item.kind === 'preset' && item.inner === PRESET_PATCH) continue; // judged below, on its meaning
+    const file = path.join(dir[item.kind], item.inner.split('/').join(path.sep));
+    if (exists(file)) installed[item.kind] = true;
+    if (!exists(file) || sha256(file) !== item.sha) fileDiffers[item.kind] = true;
+  }
+  return {
+    packageOk: !!pkg, bundles, deps,
+    method: hasPreset && hasCompact ? 'both' : hasPreset ? 'preset' : hasCompact ? 'global' : 'none',
+    link, dir, fileDiffers, installed,
+    version: { preset: pkgField(dir.preset, 'version'), compact: pkgField(dir.compact, 'version') },
+  };
+}
+/** ids of the `- id:` rows of a preset patch, the SAC additions left out. */
+function pluginIds(text) {
+  return String(text).split(/\r?\n/).map((l) => l.trim()).filter((l) => /^- id:/.test(l))
+    .map((l) => l.replace(/^- id:\s*/, '').replace(/\s+$/, ''));
+}
+/**
+ * How the installed preset patch stands against this kit and this client:
+ *   missing | not-sac (another preset) | legacy (not the shipped policy)
+ *   stale (the client's standard preset gained or lost plugins) | ok
+ * `standard` null: the plugin list cannot be compared, the result is then ok-unchecked.
+ */
+function presetPatchStatus(dir, standard) {
+  const file = path.join(dir, PRESET_PATCH);
+  if (!exists(file)) return 'missing';
+  const text = readText(file);
+  if (!/^\s*- id:\s*preset-sac\s*$/m.test(text)) return 'not-sac';
+  let cfg = null;
+  try { cfg = readSacConfig(text); } catch (e) { return 'legacy'; }
+  if (!sameValue(cfg, KIT.sacConfig)) return 'legacy';
+  if (!standard) return 'ok-unchecked';
+  const mine = pluginIds(text).filter((id) => id !== 'sac-compact' && id !== KIT.preset.patchId);
+  return sameValue(mine, pluginIds(standard).filter((id) => id !== 'preset-standard')) ? 'ok' : 'stale';
+}
+function printState(state, caps, patchStatus) {
+  status('kit=' + KIT.version + ' dsh-root=' + DSH_ROOT + ' profile=' + ARGS.profile);
+  status('dsh.version=' + show(caps.dshVersion) + ' client.preset-support=' + caps.preset + ' client.compact-region-api=' + show(caps.compactRegion));
+  status('registered=' + state.method);
+  for (const kind of KINDS) {
+    status(DIR[kind] + '.version=' + show(state.version[kind]) + ' files-differ=' + state.fileDiffers[kind] + ' dir=' + state.dir[kind]);
+  }
+  status('preset-patch=' + patchStatus);
+}
+
+function clientRunning() {
+  if (process.platform === 'win32') return /deepseek.?harness/i.test(execText('tasklist', ['/FO', 'CSV', '/NH']));
+  return execText('ps', ['-axo', 'pid=,comm=']).split(/\r?\n/).some((line) => {
+    const pid = parseInt(line.trim(), 10);
+    return pid !== process.pid && pid !== process.ppid && /DeepSeek Harness/i.test(line);
+  });
+}
+
+// ---------- backup / rollback ----------
+/** Copy the current state to `root/<stamp>-<action>...`; returns the backup directory. */
+function makeBackup(root, action, state) {
+  const from = state.installed.compact && state.version.compact ? '-from-' + state.version.compact.replace(/[^\w.-]/g, '_')
+    : state.installed.compact || state.installed.preset ? '-from-unknown' : '-fresh';
+  const dir = path.join(root, stamp() + '-' + action + from);
+  fs.mkdirSync(dir, { recursive: true });
+  const record = [];
+  const skipped = [];
+  const save = (label, from, to) => {
+    if (!isRegularFile(from)) return;
+    try { copyFile(from, to); } catch (e) { skipped.push(label + ' (' + (e && e.code ? e.code : e.message) + ')'); }
+  };
+  for (const name of ['package.json', 'pnpm-lock.yaml', 'cordis.patch.yml']) save(name, path.join(PROFILE_DIR, name), path.join(dir, 'profile', name));
+  for (const kind of KINDS) {
+    if (pkgField(state.dir[kind], 'name') !== sacName(kind)) continue;
+    try { copyTree(state.dir[kind], path.join(dir, 'plugins', DIR[kind]), record); }
+    catch (e) { skipped.push(DIR[kind] + ' (' + (e && e.code ? e.code : e.message) + ')'); }
+  }
+  if (skipped.length) warn('the backup is incomplete, these files could not be copied: ' + skipped.join(', '));
+  writeJson(path.join(dir, 'state.json'), {
+    kit: KIT.version, action, time: new Date().toISOString(), profile: ARGS.profile, profileDir: PROFILE_DIR,
+    pluginsDir: PLUGINS_DIR, method: state.method, bundles: state.bundles,
+    sacDeps: { preset: own(state.deps, PRESET), compact: own(state.deps, COMPACT) },
+    links: state.link, dirs: state.dir, versions: state.version,
+    files: record.map((f) => ({ path: toPosix(path.relative(dir, f.path)), sha256: f.sha256 })),
+  });
+  return dir;
+}
+function own(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key) ? String(obj[key]) : null; }
+
+/** Recreate the node_modules link unless it already resolves to `target`. */
+function ensureLink(linkPath, target, kind) {
+  const info = linkInfo(linkPath);
+  if (info.exists && info.real && samePath(info.real, target)) return false;
+  if (info.exists && !info.isLink && !isSacDir(linkPath, kind)) {
+    throw new Error(linkPath + ' is a real directory that is not the SAC ' + kind + ' package; move it away by hand');
+  }
+  if (info.exists) fs.rmSync(linkPath, { force: true, recursive: true });
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  fs.symlinkSync(target, linkPath, process.platform === 'win32' ? 'junction' : 'dir');
+  return true;
+}
+
+function latestBackup() {
+  if (ARGS.backup) return path.resolve(ARGS.backup);
+  if (!exists(BACKUP_ROOT)) return null;
+  const list = fs.readdirSync(BACKUP_ROOT).filter((n) => exists(path.join(BACKUP_ROOT, n, 'state.json'))).sort();
+  return list.length ? path.join(BACKUP_ROOT, list[list.length - 1]) : null;
+}
+function readBackup(dir) {
+  const state = exists(path.join(dir, 'state.json')) ? safeJson(readText(path.join(dir, 'state.json'))) : null;
+  if (!state || !state.dirs || !Array.isArray(state.bundles)) throw new Error('backup ' + dir + ' has no readable state.json');
+  const samePath = (a, b) => process.platform === 'win32' ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase() : path.resolve(a) === path.resolve(b);
+  if (!samePath(state.profileDir, PROFILE_DIR)) throw new Error('backup ' + dir + ' belongs to profile ' + state.profileDir + ': run with -profile ' + state.profile);
+  return state;
+}
+/** Put the plugin files, registration, links and lockfile of `backup` back. Every part is
+ *  tried even when an earlier one fails; the error then lists what could not be restored. */
+function applyBackup(backup, quiet) {
+  const state = readBackup(backup);
+  const tell = quiet ? () => {} : note;
+  const errors = [];
+  const attempt = (label, fn) => { try { fn(); } catch (e) { errors.push(label + ': ' + (e && e.message ? e.message : e)); } };
+  for (const kind of KINDS) {
+    const src = path.join(backup, 'plugins', DIR[kind]);
+    const target = state.dirs[kind];
+    const had = pkgField(src, 'name') === sacName(kind);
+    attempt(DIR[kind], () => {
+      if (had) {
+        if (!isSacDir(target, kind)) throw new Error('refusing to replace ' + target + ': it is not the SAC ' + kind + ' directory');
+        if (exists(target)) fs.rmSync(target, { recursive: true, force: true });
+        copyTree(src, target);
+        tell(DIR[kind] + ' ' + show((state.versions || {})[kind]) + ' restored -> ' + target);
+      } else if (isSacDir(target, kind) && inside(target, PLUGINS_DIR)) {
+        fs.rmSync(target, { recursive: true, force: true });
+        tell(DIR[kind] + ' was not installed before that backup: removed ' + target);
+      } else {
+        tell(DIR[kind] + ' was not installed before that backup: ' + target + ' left untouched');
+      }
+    });
+  }
+  const bad = (state.files || []).filter((f) => {
+    if (f.path.indexOf('plugins/') !== 0) return false;
+    const parts = f.path.split('/');
+    const file = path.join(state.dirs[parts[1] === DIR.preset ? 'preset' : 'compact'], parts.slice(2).join(path.sep));
+    return !exists(file) || sha256(file) !== f.sha256;
+  });
+  if (bad.length) errors.push('restored files do not match the backup: ' + bad.map((f) => f.path).join(', '));
+  attempt('package.json', () => {
+    if (!exists(PKG)) return;
+    const before = safeJson(readText(PKG)) || {};
+    const pkg = safeJson(readText(PKG)) || {};
+    pkg.dependencies = pkg.dependencies || {};
+    delete pkg.dependencies[PRESET]; delete pkg.dependencies[COMPACT];
+    for (const name of [PRESET, COMPACT]) {
+      const value = state.sacDeps ? state.sacDeps[name === PRESET ? 'preset' : 'compact'] : null;
+      if (value) pkg.dependencies[name] = value;
+    }
+    pkg.dsh = pkg.dsh || {}; pkg.dsh.profile = pkg.dsh.profile || {};
+    pkg.dsh.profile.bundles = (pkg.dsh.profile.bundles || []).filter((b) => b !== PRESET && b !== COMPACT);
+    for (const b of state.bundles) if ((b === PRESET || b === COMPACT) && pkg.dsh.profile.bundles.indexOf(b) < 0) pkg.dsh.profile.bundles.push(b);
+    if (JSON.stringify(pkg) !== JSON.stringify(before)) writeJson(PKG, pkg);
+    tell('package.json: SAC entries back to "' + state.method + '"');
+  });
+  for (const kind of KINDS) {
+    attempt('link ' + DIR[kind], () => {
+      const linkPath = path.join(NM_LOCAL, DIR[kind]);
+      const info = state.links ? state.links[kind] : null;
+      if (info && info.exists && info.isLink && info.real) {
+        ensureLink(linkPath, info.real, kind);
+        tell('link ' + DIR[kind] + ' -> ' + info.real);
+      } else if (info && info.exists) {
+        tell(DIR[kind] + ' stays the real directory it was: ' + linkPath);
+      } else if (linkInfo(linkPath).isLink) {
+        fs.rmSync(linkPath, { force: true });
+        tell('link ' + DIR[kind] + ' removed (there was none before)');
+      }
+    });
+  }
+  attempt('pnpm-lock.yaml', () => {
+    const lock = path.join(backup, 'profile', 'pnpm-lock.yaml');
+    if (isRegularFile(lock)) { copyFile(lock, path.join(PROFILE_DIR, 'pnpm-lock.yaml')); tell('pnpm-lock.yaml restored'); }
+  });
+  if (errors.length) throw new Error(errors.join('; '));
+  return state;
+}
+function doRollback() {
+  const backup = latestBackup();
+  if (!backup) fail(EXIT.NOTHING, 'no backup found under ' + BACKUP_ROOT);
+  const state = readBackup(backup);
+  say('rolling back from ' + backup + ' (taken ' + state.time + ', action "' + state.action + '")');
+  const undo = makeBackup(UNDO_ROOT, 'before-rollback', detectState());
+  note('the state as it is now was saved to ' + undo);
+  applyBackup(backup, false);
+  say('rollback complete. Fully quit and restart DeepSeek Harness, then start a NEW session.');
+  note('to undo this rollback: ' + launcherName() + ' -rollback -backup "' + undo + '" -profile ' + ARGS.profile);
+  return EXIT.OK;
+}
+
+// ---------- preset generation ----------
+function indentOf(line) { return line.length - line.replace(/^ +/, '').length; }
+function findConfigIndex(lines, ownerIdx) {
+  for (let i = ownerIdx + 1; i < lines.length; i += 1) {
+    if (lines[i].trim() && indentOf(lines[i]) <= indentOf(lines[ownerIdx])) break;
+    if (indentOf(lines[i]) === indentOf(lines[ownerIdx]) + 2 && /^config:\s*$/.test(lines[i].trim())) return i;
+  }
+  return -1;
+}
+function blockEnd(lines, start) {
+  for (let i = start + 1; i < lines.length; i += 1) if (lines[i].trim() && indentOf(lines[i]) <= indentOf(lines[start])) return i;
+  return lines.length;
+}
+/** Set (or insert, right after `config:`) the metadata rows of the preset declaration. */
+function setMetaRows(lines, cfgIdx) {
+  const pad = ' '.repeat(indentOf(lines[cfgIdx]) + 2);
+  const end = blockEnd(lines, cfgIdx);
+  for (const key of ['order', 'description', 'name']) {
+    const row = pad + key + ': ' + yamlScalar(KIT.preset[key]);
+    let at = -1;
+    for (let i = cfgIdx + 1; i < end; i += 1) if (indentOf(lines[i]) === indentOf(lines[cfgIdx]) + 2 && lines[i].trim().indexOf(key + ':') === 0) { at = i; break; }
+    if (at >= 0) lines[at] = row; else lines.splice(cfgIdx + 1, 0, row);
+  }
+}
+/** The `sac-compact` item of a compaction group, written at indentation `pad`. */
+function sacEntryLines(pad) {
+  return [pad + '- id: sac-compact', pad + "  name: '@local/dsh-sac-preset/sac'", pad + '  inject:',
+    pad + '    - systemPrompt', pad + '    - tools', pad + '    - llm', pad + '  config:']
+    .concat(emitConfig(KIT.sacConfig, pad + '    '));
+}
+/**
+ * Derive the SAC preset from this client's own standard preset: a preset must
+ * enumerate exactly the plugins the client ships. Returns the patch text.
+ */
+function buildSacPreset(std) {
+  const lines = std.split(/\r?\n/);
+  const declIdx = lines.findIndex((l) => /^\s*- id:\s*preset-standard\s*$/.test(l));
+  if (declIdx < 0) throw new Error('preset-standard row not found in the standard preset');
+  const declIndent = indentOf(lines[declIdx]);
+  const cfgIdx = findConfigIndex(lines, declIdx);
+  if (cfgIdx < 0) throw new Error('the standard preset declaration has no config block');
+  const cfgIndent = indentOf(lines[cfgIdx]);
+  let idIdx = -1;
+  for (let i = cfgIdx + 1; i < blockEnd(lines, cfgIdx); i += 1) if (indentOf(lines[i]) === cfgIndent + 2 && /^id:\s*standard\s*$/.test(lines[i].trim())) { idIdx = i; break; }
+  if (idIdx < 0) throw new Error('config.id: standard not found');
+  lines[declIdx] = ' '.repeat(declIndent) + '- id: ' + KIT.preset.patchId;
+  lines[idIdx] = ' '.repeat(cfgIndent + 2) + 'id: ' + KIT.preset.id;
+  setMetaRows(lines, cfgIdx);
+  // The compaction group of the plugin list: the policy goes into its config list.
+  const compIdx = lines.findIndex((l, i) => i > declIdx && /^\s*- id:\s*compaction\s*$/.test(l));
+  if (compIdx < 0) throw new Error('the standard preset has no compaction group');
+  const compCfg = findConfigIndex(lines, compIdx);
+  if (compCfg < 0) throw new Error('the compaction group has no config list');
+  let itemInd = -1;
+  for (let i = compCfg + 1; i < blockEnd(lines, compCfg); i += 1) {
+    const m = lines[i].match(/^(\s*)- id:/);
+    if (m) { itemInd = m[1].length; break; }
+  }
+  if (itemInd < 0) throw new Error('cannot find the compaction items');
+  lines.splice(blockEnd(lines, compCfg), 0, ...sacEntryLines(' '.repeat(itemInd)));
+  let start = 0;
+  while (start < lines.length && (lines[start].charAt(0) === '#' || !lines[start].trim())) start += 1;
+  return ['# Agent preset "sac": generated at update time from this client\'s own standard preset,',
+    '# plus the Single-Action Compaction policy (@local/dsh-sac-preset/sac) in the same isolated compaction group.']
+    .concat(lines.slice(start)).join('\n') + '\n';
+}
+/**
+ * Keep an installed preset's plugin list (it was derived from this client at
+ * its first install) and replace only its `sac-compact` entry and metadata.
+ * Returns null when the text is not an SAC preset.
+ */
+function reconfigSacPreset(text) {
+  if (!text || !/^\s*- id:\s*preset-sac\s*$/m.test(text)) return null;
+  const lines = text.split(/\r?\n/);
+  const entry = lines.findIndex((l) => /^\s*- id:\s*sac-compact\s*$/.test(l));
+  if (entry < 0) return null;
+  lines.splice(entry, blockEnd(lines, entry) - entry, ...sacEntryLines(' '.repeat(indentOf(lines[entry]))));
+  const declIdx = lines.findIndex((l) => /^\s*- id:\s*preset-sac\s*$/.test(l));
+  const cfgIdx = findConfigIndex(lines, declIdx);
+  if (cfgIdx >= 0) setMetaRows(lines, cfgIdx);
+  return lines.join('\n');
+}
+
+/** Run the plugin's own test files with this node (offline, a few seconds). */
+function selfTest(targets) {
+  if (parseInt(process.versions.node.split('.')[0], 10) < 18) return { skipped: 'node ' + process.versions.node + ' has no --test runner' };
+  const files = PAYLOAD.filter((item) => /\.test\.js$/.test(item.rel)).map((item) => path.join(targets[item.kind], item.inner.split('/').join(path.sep)));
+  if (!files.length) return { skipped: 'the kit ships no tests' };
+  const run = spawnSync(process.execPath, ['--test', '--test-reporter=tap'].concat(files), {
+    cwd: targets.compact, encoding: 'utf8', timeout: 180000, env: Object.assign({}, process.env, { ELECTRON_RUN_AS_NODE: '1' }),
+  });
+  const out = (run.stdout || '') + (run.stderr || '');
+  const count = (key) => { const m = out.match(new RegExp('^# ' + key + ' (\\d+)', 'm')); return m ? parseInt(m[1], 10) : 0; };
+  if (run.error) return { error: run.error.message };
+  if (!/^# tests \d+/m.test(out)) return { error: 'the test runner printed no summary (exit ' + run.status + ')' };
+  return { pass: count('pass'), fail: count('fail') };
+}
+function launcherName() { return process.platform === 'win32' ? 'update-sac.cmd' : './update-sac.sh'; }
+
+async function main() {
+  if (!exists(PROFILE_DIR)) {
+    console.log('[SAC] profile "' + ARGS.profile + '" does not exist under ' + path.join(DSH_ROOT, 'profiles') + '. Profiles found:');
+    let any = false;
+    try { for (const d of fs.readdirSync(path.join(DSH_ROOT, 'profiles'), { withFileTypes: true })) if (d.isDirectory()) { console.log('        ' + d.name); any = true; } } catch (e) {}
+    if (!any) console.log('        (none)');
+    fail(EXIT.USAGE, 'pass -profile <name>, or -dsh-root <path> if .dsh lives elsewhere');
+  }
+  if (!exists(PKG)) fail(EXIT.STOPPED, PROFILE_DIR + ' has no package.json: not a DSH profile');
+  let state = detectState();
+  if (!state.packageOk) fail(EXIT.STOPPED, PKG + ' cannot be parsed; fix it by hand first');
+  if (ARGS.rollback) return doRollback();
+
+  const caps = clientCapabilities(ARGS.noAdapt ? null : findAppAsar(ARGS.appAsar));
+  const patchStatus = presetPatchStatus(state.dir.preset, caps.standardPreset);
+  printState(state, caps, patchStatus);
+
+  // ----- how SAC is mounted -----
+  let method = ARGS.method;
+  let why = ARGS.method ? 'requested with -' + ARGS.method : '';
+  if (!method && (state.method === 'preset' || state.method === 'global')) { method = state.method; why = 'this profile already mounts it that way'; }
+  if (!method && state.method === 'both') { method = 'preset'; warn('both ' + PRESET + ' and ' + COMPACT + ' were registered (SAC would load twice); keeping the preset method only'); why = 'of the two registered bundles, the preset is kept'; }
+  if (!method && ARGS.noAdapt) { method = 'preset'; why = 'no client lookup (-no-adapt): the bundled preset is used as-is'; }
+  if (!method && caps.preset) { method = 'preset'; why = 'this client supports agent presets'; }
+  if (!method) {
+    method = 'global';
+    why = caps.dshVersion ? 'client ' + caps.dshVersion + ' has no agent-preset mechanism' : 'the client could not be found, so its preset support is unknown';
+    if (ARGS.appAsar) why = 'this client build has no agent-preset mechanism';
+  }
+  note('mount: ' + method + ' (' + why + ')');
+  if (method === 'preset' && patchStatus === 'stale') note('the client\'s standard preset changed since the SAC preset was generated: it will be generated again');
+  if (method === 'global' && caps.compactRegion === false) warn('this client build has no compactRegion(): SAC cannot fold on it');
+
+  const outdated = { compact: state.fileDiffers.compact, preset: state.fileDiffers.preset || (method === 'preset' && patchStatus !== 'ok' && patchStatus !== 'ok-unchecked') };
+  const upToDate = state.method === method && !outdated.compact && !outdated.preset;
+
+  if (ARGS.check) {
+    status('client.running=' + clientRunning());
+    status('mount=' + method + ' up-to-date=' + upToDate);
+    if (upToDate) { say('SAC ' + KIT.version + ' is installed and up to date (' + method + ' method).'); return EXIT.OK; }
+    say((state.method === 'none' ? 'SAC is not registered in this profile. ' : '') + 'an update is needed:');
+    for (const kind of KINDS) {
+      if (!outdated[kind]) continue;
+      note(DIR[kind] + ': ' + (state.version[kind] || 'not installed') + ' -> ' + KIT[kind + 'Version'] + ' (' + (state.fileDiffers[kind] ? 'files differ from the kit' : 'preset patch: ' + patchStatus) + ')');
+    }
+    if (state.method !== method) note('registration: ' + state.method + ' -> ' + method);
+    say('run this command again without -check to apply it. Nothing was changed.');
+    return EXIT.UPDATE_AVAILABLE;
+  }
+  if (ARGS.uninstall) return doUninstall(state);
+  if (upToDate) {
+    say('SAC ' + KIT.version + ' is already installed and up to date (' + method + ' method). Nothing to do.');
+    return EXIT.OK;
+  }
+
+  // ----- preconditions, before anything is touched -----
+  const targets = { preset: state.dir.preset, compact: state.dir.compact };
+  for (const kind of KINDS) {
+    if (exists(targets[kind]) && !isSacDir(targets[kind], kind)) fail(EXIT.STOPPED, 'refusing to touch ' + targets[kind] + ': it is not the SAC ' + kind + ' directory');
+    if (!inside(targets[kind], PLUGINS_DIR)) note('the profile loads ' + DIR[kind] + ' from ' + targets[kind] + ' (outside ' + PLUGINS_DIR + '): it is updated in place');
+  }
+  if (method === 'preset' && !caps.standardPreset) {
+    note(caps.asar ? 'the client ships no readable standard preset: ' + (patchStatus === 'missing' || patchStatus === 'not-sac' ? 'the bundled preset is used as-is and may not load on this client' : 'the installed preset keeps its plugin list')
+      : 'app.asar was not found: ' + (patchStatus === 'ok-unchecked' || patchStatus === 'stale' ? 'the installed preset keeps its plugin list' : 'the bundled preset is used as-is and may not load on this client') + ' (pass -app-asar <path> to adapt it)');
+  }
+  const running = clientRunning();
+  if (running) {
+    warn('DeepSeek Harness is running. Quit it completely first if you can: its sessions keep the old code until it restarts, and a file in use can fail the update (it would then roll back by itself).');
+  }
+  let answer = false;
+  try { answer = await confirm('Update SAC in profile "' + ARGS.profile + '" now?'); } catch (e) { fail(EXIT.STOPPED, e.message); }
+  if (!answer) { say('cancelled. Nothing was changed.'); return EXIT.STOPPED; }
+
+  // ----- update -----
+  const previousPresetPatch = exists(path.join(targets.preset, PRESET_PATCH)) ? readText(path.join(targets.preset, PRESET_PATCH)) : null;
+  const fresh = state.method === 'none';
+  const backup = makeBackup(BACKUP_ROOT, 'update', state);
+  say('1/6 current state saved -> ' + backup);
+  const undoOnFailure = (context) => {
+    console.error('[SAC] ERROR: ' + context);
+    console.error('[SAC] the update did not complete: restoring the previous state from ' + backup);
+    try { applyBackup(backup, true); } catch (e) { console.error('[SAC] ERROR: automatic rollback failed: ' + (e && e.message ? e.message : e)); fail(EXIT.STOPPED, 'restore it with ' + launcherName() + ' -rollback -profile ' + ARGS.profile); }
+    fail(EXIT.STOPPED, 'update aborted; the previous state is back (backup kept in ' + backup + ')');
+  };
+  const step = (label, fn) => {
+    say(label);
+    try { fn(); } catch (e) { undoOnFailure(label + ' failed: ' + (e && e.message ? e.message : e)); }
+  };
+  const presetPatchFile = path.join(targets.preset, PRESET_PATCH);
+
+  step('2/6 writing the plugin files', () => {
+    for (const item of PAYLOAD) {
+      const dest = path.join(targets[item.kind], item.inner.split('/').join(path.sep));
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, item.data);
+    }
+    // A file of an older version that the kit no longer ships must not stay loadable.
+    const shipped = new Set(PAYLOAD.map((item) => path.resolve(path.join(targets[item.kind], item.inner.split('/').join(path.sep)))));
+    const prune = (dir) => {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) { if (e.name !== 'node_modules') prune(full); continue; }
+        if (!shipped.has(path.resolve(full)) && /\.(js|mjs|cjs|json|ya?ml|md)$/i.test(e.name)) { fs.unlinkSync(full); note('removed a file the kit no longer ships: ' + full); }
+      }
+    };
+    for (const kind of KINDS) if (exists(targets[kind])) prune(targets[kind]);
+  });
+
+  step('3/6 preset', () => {
+    if (method !== 'preset') return note('profile-level mount: the plugin bundle\'s own config is used; no preset is registered');
+    let text = null, how = '';
+    if (caps.standardPreset && (patchStatus !== 'ok' || fresh)) {
+      try { text = buildSacPreset(caps.standardPreset); how = 'generated from this client\'s standard preset (' + show(caps.dshVersion) + ')'; }
+      catch (e) { warn('the client\'s standard preset has an unexpected shape (' + e.message + ')'); }
+    }
+    if (text === null && (patchStatus === 'ok' || patchStatus === 'ok-unchecked' || patchStatus === 'stale')) {
+      text = reconfigSacPreset(previousPresetPatch) || reconfigSacPreset(readText(presetPatchFile));
+      how = 'the installed preset kept its plugin list; its sac-compact entry and metadata were replaced';
+    }
+    if (text === null) { text = readText(presetPatchFile); how = 'the bundled preset, not adapted to this client'; }
+    fs.writeFileSync(presetPatchFile, text);
+    note('preset patch: ' + how);
+    const after = presetPatchStatus(targets.preset, caps.standardPreset);
+    if (after !== 'ok' && after !== 'ok-unchecked') throw new Error('the preset patch ended up as "' + after + '"');
+  });
+
+  const add = method === 'global' ? COMPACT : PRESET;
+  const other = method === 'global' ? PRESET : COMPACT;
+  const addTarget = registeredTarget(own(state.deps, add), method === 'global' ? targets.compact : targets.preset);
+  step('4/6 registering in the profile', () => {
+    const pkg = safeJson(readText(PKG)) || { name: 'dsh-profile-' + ARGS.profile, private: true, dsh: { profile: { bundles: [] } } };
+    pkg.dependencies = pkg.dependencies || {};
+    delete pkg.dependencies[other];
+    pkg.dependencies[add] = 'link:' + addTarget;
+    pkg.dsh = pkg.dsh || {}; pkg.dsh.profile = pkg.dsh.profile || {};
+    pkg.dsh.profile.bundles = (pkg.dsh.profile.bundles || []).filter((b) => b !== other);
+    if (pkg.dsh.profile.bundles.indexOf(add) < 0) pkg.dsh.profile.bundles.push(add);
+    writeJson(PKG, pkg);
+    note('package.json: dependencies + ' + add + ' (link), bundles + ' + add);
+  });
+
+  step('5/6 node_modules link' + (process.platform === 'win32' ? ' (junction, no administrator needed)' : ''), () => {
+    const made = ensureLink(path.join(NM_LOCAL, DIR.preset), targets.preset, 'preset');
+    note((made ? 'created ' : 'kept ') + path.join(NM_LOCAL, DIR.preset) + ' -> ' + targets.preset);
+    const compactLink = path.join(NM_LOCAL, DIR.compact);
+    if (method === 'global') note((ensureLink(compactLink, targets.compact, 'compact') ? 'created ' : 'kept ') + compactLink + ' -> ' + targets.compact);
+    else if (linkInfo(compactLink).isLink) { fs.rmSync(compactLink, { force: true }); note('removed the ' + DIR.compact + ' link (not used with the preset method)'); }
+  });
+
+  step('6/6 pnpm-lock.yaml', () => {
+    const lock = path.join(PROFILE_DIR, 'pnpm-lock.yaml');
+    if (!isRegularFile(lock)) return note('no readable lockfile: skipped (the client regenerates it)');
+    let text = readText(lock);
+    text = text.replace(new RegExp('^\\s+\'' + add.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\':\\r?\\n(?:[^\\S\\r\\n]+\\S.*(?:\\r?\\n))+', 'm'), '');
+    const entry = "      '" + add + "':\n        specifier: link:" + toPosix(addTarget) + '\n        version: link:' + toPosix(path.relative(PROFILE_DIR, addTarget)) + '\n';
+    // pnpm leaves blank lines after `importers:`, so they are allowed here.
+    const anchor = text.match(/^importers:\r?\n(?:[^\S\r\n]*\r?\n)*  \.:\r?\n    dependencies:\r?\n/m);
+    if (!anchor) return note('unrecognized lockfile layout: skipped (if the client complains, delete pnpm-lock.yaml and restart)');
+    fs.writeFileSync(lock, text.slice(0, anchor.index + anchor[0].length) + entry + text.slice(anchor.index + anchor[0].length));
+    note('lockfile entry of ' + add + ' updated');
+  });
+
+  // ----- verification -----
+  say('verifying');
+  const problems = [];
+  for (const item of PAYLOAD) {
+    if (item.kind === 'preset' && item.inner === PRESET_PATCH && method === 'preset') continue; // generated above
+    const file = path.join(targets[item.kind], item.inner.split('/').join(path.sep));
+    if (!exists(file) || sha256(file) !== item.sha) problems.push(item.rel + ' differs from the kit');
+  }
+  const versions = { preset: pkgField(targets.preset, 'version'), compact: pkgField(targets.compact, 'version') };
+  if (versions.compact !== KIT.compactVersion) problems.push('compact plugin version is ' + show(versions.compact) + ', expected ' + KIT.compactVersion);
+  if (versions.preset !== KIT.presetVersion) problems.push('preset version is ' + show(versions.preset) + ', expected ' + KIT.presetVersion);
+  state = detectState();
+  if (state.method !== method) problems.push('the profile registers "' + state.method + '", expected "' + method + '"');
+  if (!state.link.preset.real || !samePath(state.link.preset.real, targets.preset)) problems.push('node_modules/@local/' + DIR.preset + ' does not resolve to ' + targets.preset);
+  if (method === 'global' && (!state.link.compact.real || !samePath(state.link.compact.real, targets.compact))) problems.push('node_modules/@local/' + DIR.compact + ' does not resolve to ' + targets.compact);
+  if (method === 'preset' && state.link.compact.broken === false && state.link.compact.exists) problems.push('node_modules/@local/' + DIR.compact + ' is still linked: remove it by hand');
+  try {
+    const active = readSacConfig(readText(method === 'global' ? path.join(targets.compact, PRESET_PATCH) : presetPatchFile));
+    if (!sameValue(active, KIT.sacConfig)) problems.push('the active sac-compact config is not the shipped policy');
+  } catch (e) { problems.push('the active sac-compact config cannot be read: ' + e.message); }
+  if (problems.length) undoOnFailure('verification failed: ' + problems.join('; '));
+  note('all ' + PAYLOAD.length + ' files match the kit (SHA-256); versions ' + versions.compact + ' / ' + versions.preset + '; the active config is the shipped policy');
+
+  let code = EXIT.OK;
+  if (ARGS.test) {
+    const result = selfTest(targets);
+    if (result.skipped) note('self-test skipped: ' + result.skipped);
+    else if (result.error || result.fail > 0) { warn('self-test FAILED: ' + (result.error || result.fail + ' test(s) failed') + ' (the plugin is installed; review before relying on it)'); code = EXIT.TEST_FAILED; }
+    else note('self-test: ' + result.pass + ' test(s) passed on node ' + process.versions.node);
+  }
+  console.log('');
+  say((fresh ? 'install' : 'update') + ' complete: SAC ' + KIT.version + ', ' + method + ' method.');
+  note('1. Fully quit and restart DeepSeek Harness (closing its window is not enough).' + (running ? ' It is running now.' : ''));
+  note(method === 'global' ? '2. SAC is active in every session of profile "' + ARGS.profile + '".'
+    : '2. Create a NEW session and pick the preset "SAC" (SAC single-action compaction); sessions on other presets never load it.');
+  note('3. A fold logs "dsh-sac-compact: folded N action(s) ...". On a short dialogue nothing folds: that is intended.');
+  note('4. Undo with: ' + launcherName() + ' -rollback -profile ' + ARGS.profile + '   (backup: ' + backup + ')');
+  return code;
+}
+
+function doUninstall(state) {
+  const backup = makeBackup(BACKUP_ROOT, 'uninstall', state);
+  say('uninstalling from profile "' + ARGS.profile + '" (the current state is saved in ' + backup + ')');
+  const pkg = safeJson(readText(PKG)) || {};
+  if (pkg.dependencies) { delete pkg.dependencies[PRESET]; delete pkg.dependencies[COMPACT]; }
+  pkg.dsh = pkg.dsh || {}; pkg.dsh.profile = pkg.dsh.profile || {};
+  pkg.dsh.profile.bundles = (pkg.dsh.profile.bundles || []).filter((b) => b !== PRESET && b !== COMPACT);
+  writeJson(PKG, pkg);
+  note('package.json: SAC entries removed');
+  for (const kind of KINDS) {
+    const linkPath = path.join(NM_LOCAL, DIR[kind]);
+    if (linkInfo(linkPath).isLink) fs.rmSync(linkPath, { force: true });
+    else if (isSacDir(linkPath, kind)) fs.rmSync(linkPath, { recursive: true, force: true });
+  }
+  try { fs.rmdirSync(NM_LOCAL); } catch (e) {}
+  if (ARGS.purge) {
+    for (const kind of KINDS) {
+      const dir = path.join(PLUGINS_DIR, DIR[kind]);
+      if (isSacDir(dir, kind)) fs.rmSync(dir, { recursive: true, force: true });
+    }
+    try { fs.rmdirSync(PLUGINS_DIR); } catch (e) {}
+    note('plugin files deleted under ' + PLUGINS_DIR);
+  }
+  say('uninstall complete. Restart the client to apply. Install again with: ' + launcherName() + ' -profile ' + ARGS.profile);
+  return EXIT.OK;
+}
+
+main().then((code) => finish(code === undefined ? EXIT.OK : code), (e) => fail(EXIT.STOPPED, e && e.message ? e.message : String(e)));

@@ -1,0 +1,12 @@
+# Inserted by the @local/dsh-tau2-bridge bundle.
+#
+# The plugin is idle unless the process environment carries TAU2_BRIDGE_URL
+# (set per DSH invocation by harness/tau2/run.py). It then registers the tau2
+# tools listed in TAU2_BRIDGE_TOOLS and mounts the domain policy from
+# TAU2_BRIDGE_POLICY as a system-prompt section.
+- insert:
+    - id: tau2-bridge
+      name: '@local/dsh-tau2-bridge'
+      inject:
+        - systemPrompt
+        - tools

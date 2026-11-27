@@ -1,0 +1,307 @@
+#!/usr/bin/env node
+// ============================================================================
+// diagnose-sac.js - read-only SAC deployment report, kit __VERSION__
+//
+// Run on the target machine (diagnose-sac.cmd / diagnose-sac.sh, or
+// `node diagnose-sac.js`). It checks every link of the chain and changes nothing:
+//   A DSH version -> B profile registration -> C node_modules links -> D plugin
+//   files -> E active policy -> F lockfile -> G plugin-manager logs ->
+//   H client capabilities -> I preset coverage -> J backups
+// Copy the whole output back for analysis.
+//
+// Exit codes: 0 no findings | 10 findings (see VERDICT) | 2 cannot run here
+// ============================================================================
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+/** Kit metadata, filled in by tools/build_sac_deploy_kit.py. */
+const KIT = __KIT__;
+
+__SHARED__
+
+const COMPACT = '@local/dsh-sac-compact';
+const PRESET = '@local/dsh-sac-preset';
+const DIR = { compact: 'dsh-sac-compact', preset: 'dsh-sac-preset' };
+const VERIFIED = '0.2.2-rc.5';
+
+const args = { profile: 'desktop' };
+for (let i = 2; i < process.argv.length; i += 1) {
+  const k = String(process.argv[i]).replace(/^[-/]+/, '').toLowerCase();
+  const next = () => { if (i + 1 >= process.argv.length) { console.error('[SAC] ERROR: missing value for ' + process.argv[i]); process.exit(2); } return process.argv[++i]; };
+  if (k === 'dshroot' || k === 'dsh-root') args.dshRoot = next();
+  else if (k === 'appasar' || k === 'app-asar') args.appAsar = next();
+  else if (k === 'profile' || k === 'profilename') args.profile = next();
+  else if (k === 'help' || k === 'h' || k === '?') { console.log('Usage: node diagnose-sac.js [-profile NAME] [-dsh-root PATH] [-app-asar PATH]  (read-only)'); process.exit(0); }
+  else { console.error('[SAC] ERROR: unknown argument: ' + process.argv[i]); process.exit(2); }
+}
+const DSH_ROOT = args.dshRoot || process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+const PROFILES_DIR = path.join(DSH_ROOT, 'profiles');
+const TARGET_DIR = path.join(PROFILES_DIR, args.profile);
+
+const L = [];
+const ok = (m) => L.push('  [OK]   ' + m);
+const info = (m) => L.push('  [INFO] ' + m);
+const warn = (m) => L.push('  [WARN] ' + m);
+const bad = (m) => L.push('  [FAIL] ' + m);
+const sec = (t) => L.push('\n== ' + t + ' ==');
+const FINDINGS = [];
+const finding = (f) => FINDINGS.push(f);
+const safe = (fn, dflt) => { try { return fn(); } catch (e) { return dflt; } };
+const exists = (p) => safe(() => fs.existsSync(p), false);
+const readText = (p) => fs.readFileSync(p, 'utf8');
+const toPosix = (p) => String(p).split(path.sep).join('/');
+
+function finish() {
+  console.log(L.join('\n'));
+  if (process.env.SAC_PAUSE === '1' && process.stdin.isTTY) {
+    try { process.stdout.write('\n[SAC] Press Enter to close this window... '); fs.readSync(0, Buffer.alloc(1), 0, 1); } catch (e) {}
+  }
+  process.exit(FINDINGS.length ? 10 : 0);
+}
+
+console.log('SAC deploy kit ' + KIT.version + ': @local/dsh-sac-compact ' + KIT.compactVersion + ' + @local/dsh-sac-preset ' + KIT.presetVersion);
+console.log('dsh root: ' + DSH_ROOT + '   target profile: ' + args.profile);
+
+// ---------- A. DSH version ----------
+sec('A. DeepSeek Harness version');
+const cmp = (a, b) => {
+  const pa = a.split(/[.-]/), pb = b.split(/[.-]/);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    if (pa[i] === undefined) return -1;
+    if (pb[i] === undefined) return 1;
+    if (pa[i] === pb[i]) continue;
+    const nx = parseInt(pa[i], 10), ny = parseInt(pb[i], 10);
+    return (!isNaN(nx) && !isNaN(ny)) ? (nx < ny ? -1 : 1) : (String(pa[i]) < String(pb[i]) ? -1 : 1);
+  }
+  return 0;
+};
+const runtimeJson = path.join(DSH_ROOT, 'dsh-runtimes', 'dsh-primary-runtime', 'runtime.json');
+const desktopVersion = safe(() => JSON.parse(readText(runtimeJson)).desktopVersion, null);
+if (desktopVersion) {
+  info('desktopVersion = ' + desktopVersion);
+  if (cmp(desktopVersion, VERIFIED) < 0) warn('older than ' + VERIFIED + ', the version this kit was verified with; sections H and I tell what works here');
+} else warn('cannot read ' + runtimeJson + ' (has DeepSeek Harness ever run for this user?)');
+
+// ---------- B. profile registration ----------
+sec('B. profile registration (bundles / dependencies)');
+const profiles = safe(() => fs.readdirSync(PROFILES_DIR, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name), []);
+if (!profiles.length) {
+  bad('no profile found under ' + PROFILES_DIR);
+  finding('dsh root not found: run with -dsh-root <path> if .dsh lives elsewhere');
+  finish();
+}
+if (profiles.indexOf(args.profile) < 0) { bad('profile "' + args.profile + '" does not exist'); finding('target profile missing (found: ' + profiles.join(', ') + ')'); }
+const registered = [];
+for (const p of profiles) {
+  const dir = path.join(PROFILES_DIR, p);
+  const pj = path.join(dir, 'package.json');
+  if (!exists(pj)) { if (p === args.profile) bad(p + ': no package.json'); continue; }
+  const d = safe(() => JSON.parse(readText(pj)), null);
+  if (!d) { bad(p + ': package.json cannot be parsed'); finding(p + ': package.json is not valid JSON'); continue; }
+  const bundles = safe(() => d.dsh.profile.bundles, []) || [];
+  const deps = d.dependencies || {};
+  const hasPreset = bundles.indexOf(PRESET) >= 0, hasCompact = bundles.indexOf(COMPACT) >= 0;
+  if (p === args.profile) info('target profile');
+  L.push('  ' + p + ': bundles = ' + (bundles.join(', ') || '(empty)'));
+  if (hasPreset || hasCompact || deps[PRESET] || deps[COMPACT]) {
+    for (const name of [PRESET, COMPACT]) if (deps[name]) L.push('      dependency ' + name + ' -> ' + deps[name]);
+    if (hasPreset && hasCompact) { bad(p + ': both bundles are registered; SAC would load twice in preset sessions'); finding(p + ': double registration, run the update to fix it'); }
+    else ok(p + ': ' + (hasPreset ? 'the preset bundle is registered (preset method)' : 'the compact bundle is registered (profile-wide method)'));
+    if (!hasPreset && !hasCompact) { bad(p + ': SAC is in dependencies only, not in bundles: it is NOT mounted'); finding(p + ': registered in dependencies but not in bundles; run the update'); }
+    if (hasPreset && !deps[PRESET]) { bad(p + ': ' + PRESET + ' is in bundles but not in dependencies'); finding(p + ': bundles/dependencies mismatch'); }
+    if (hasCompact && !deps[COMPACT]) { bad(p + ': ' + COMPACT + ' is in bundles but not in dependencies'); finding(p + ': bundles/dependencies mismatch'); }
+    registered.push({ profile: p, kind: hasPreset ? 'preset' : 'compact' });
+  } else if (p === args.profile) {
+    bad('SAC is NOT registered in this profile ("visible in the plugin panel" does not mean "mounted")');
+    finding('SAC is not registered in profile ' + p + ': run the update');
+  }
+}
+
+// ---------- C. links, files, active policy ----------
+sec('C. node_modules links, plugin files and the active policy (profile "' + args.profile + '")');
+const targetMethods = registered.filter((x) => x.profile === args.profile).map((x) => x.kind);
+const dirs = {};
+/** Where a package is reached from: its node_modules link, or, failing that, the directory beside the preset package. */
+function locate(kind) {
+  const link = path.join(PROFILES_DIR, args.profile, 'node_modules', '@local', DIR[kind]);
+  const st = safe(() => fs.lstatSync(link), null);
+  if (st) {
+    const isLink = st.isSymbolicLink();
+    return { link, isLink, target: isLink ? safe(() => fs.readlinkSync(link), '?') : '(a real directory)',
+      real: exists(path.join(link, 'package.json')) ? safe(() => fs.realpathSync(link), link) : null };
+  }
+  const beside = kind === 'compact' && dirs.preset ? path.join(path.dirname(dirs.preset), DIR.compact) : null;
+  const guess = beside || path.join(DSH_ROOT, 'plugins', 'sac', DIR[kind]);
+  return { link: null, isLink: false, target: null, real: exists(path.join(guess, 'package.json')) ? guess : null };
+}
+for (const kind of ['preset', 'compact']) {
+  if (!targetMethods.length) break;
+  // With the preset method the client resolves only the preset package; the compaction plugin is imported from beside it.
+  const required = kind === 'compact' ? targetMethods.indexOf('compact') >= 0 : true;
+  const loc = locate(kind);
+  if (!loc.real) {
+    if (loc.link) { bad(targetProfile() + ': @local/' + DIR[kind] + ' -> ' + loc.target + ' does not resolve'); finding('broken link ' + DIR[kind]); }
+    else if (required) { bad(targetProfile() + ': node_modules/@local/' + DIR[kind] + ' is missing (the client cannot resolve it)'); finding('missing link ' + DIR[kind]); }
+    else info('no @local/' + DIR[kind] + ' link (not needed with the method in use)');
+    continue;
+  }
+  dirs[kind] = loc.real;
+  ok(targetProfile() + ': ' + (loc.link ? '@local/' + DIR[kind] + ' -> ' + loc.target : DIR[kind] + ' reached beside the preset package: ' + loc.real));
+  const pkg = safe(() => JSON.parse(readText(path.join(loc.real, 'package.json'))), null);
+  const version = pkg && pkg.version ? String(pkg.version) : '?';
+  const expected = kind === 'preset' ? KIT.presetVersion : KIT.compactVersion;
+  if (!(pkg && pkg.name === (kind === 'preset' ? PRESET : COMPACT))) { bad('  ' + loc.real + ' is not the ' + (kind === 'preset' ? 'preset' : 'compaction') + ' package'); finding(DIR[kind] + ': unexpected package in ' + loc.real); continue; }
+  (version === expected ? ok : warn)('  ' + DIR[kind] + ' v' + version + (version === expected ? ' (this kit: ' + expected + ')' : ' - this kit installs ' + expected));
+  if (version !== expected) finding(DIR[kind] + ' is ' + version + ', this kit installs ' + expected);
+  if (!pkg.exports || !pkg.exports['.']) bad('  package.json lacks exports["."]: the plugin panel cannot read it');
+  const need = kind === 'preset' ? ['cordis.patch.yml', 'sac/index.js', 'locale/zh.json', 'package.json']
+    : ['cordis.patch.yml', 'index.js', 'lib/sac-policy.js', 'package.json'];
+  for (const f of need) if (!exists(path.join(loc.real, f))) { bad('  ' + f + ' is MISSING'); finding(DIR[kind] + ': ' + f + ' missing'); }
+}
+/** The profile under examination, as printed in findings. */
+function targetProfile() { return args.profile; }
+if (!registered.some((r) => r.profile === args.profile)) {
+  info('no active policy: SAC is not registered in the target profile');
+} else {
+  const method = registered.filter((r) => r.profile === args.profile).map((r) => r.kind).join('+');
+  const patch = method === 'preset' ? path.join(dirs.preset || '', 'cordis.patch.yml') : path.join(dirs.compact || '', 'cordis.patch.yml');
+  L.push('  -- active policy (' + (method === 'preset' ? 'the "sac" preset' : 'profile-wide') + '): ' + patch);
+  if (!exists(patch)) bad('  the patch that carries the config is missing');
+  else {
+    try {
+      const cfg = readSacConfig(readText(patch));
+      if (sameValue(cfg, KIT.sacConfig)) {
+        ok('  config = the policy this kit ships: fold by request size (fixed prompt + ' + cfg.foldMarginTokens + ' tokens, down to + ' + Math.floor(cfg.foldMarginTokens / 2)
+          + '), recaps <= ' + Math.round(cfg.recapMaxRatio * 100) + '% of their span, digests up to ' + cfg.mechanicalFoldMaxTokens + ' tokens written by the harness');
+      } else {
+        const keys = [];
+        for (const key of Object.keys(KIT.sacConfig)) if (!sameValue(cfg[key], KIT.sacConfig[key])) keys.push(key);
+        warn('  config is NOT the policy this kit ships. Differing keys: ' + keys.join(', '));
+        if (cfg.foldTrigger !== 'size') warn('  foldTrigger = ' + show(cfg.foldTrigger) + ': the plugin folds after a number of actions (the 1.2.0 behaviour), not by request size');
+        finding('the active SAC config is not the shipped policy (run the update)');
+      }
+    } catch (e) { bad('  the sac-compact config cannot be read: ' + e.message); finding('active config unreadable: ' + e.message); }
+  }
+  if (method === 'preset' && dirs.preset && exists(path.join(dirs.preset, 'cordis.patch.yml'))) {
+    const text = readText(path.join(dirs.preset, 'cordis.patch.yml'));
+    if (!/^\s*- id:\s*preset-sac\s*$/m.test(text)) { bad('  the preset patch does not declare preset-sac'); finding('preset patch is not an SAC preset'); }
+  }
+}
+function show(v) { return v === null || v === undefined ? 'unknown' : String(v); }
+
+// ---------- E. lockfile ----------
+sec('E. pnpm-lock.yaml');
+for (const r of registered.filter((x) => x.profile === args.profile)) {
+  const name = r.kind === 'preset' ? PRESET : COMPACT;
+  const lk = path.join(PROFILES_DIR, r.profile, 'pnpm-lock.yaml');
+  if (!exists(lk)) { warn(r.profile + ': no lockfile (the client regenerates it)'); continue; }
+  if (readText(lk).indexOf("'" + name + "':") >= 0) ok(r.profile + ': the lockfile has the ' + name + ' entry');
+  else warn(r.profile + ': the lockfile lacks ' + name + ' (harmless for a link: dependency; if the client complains, delete pnpm-lock.yaml and restart)');
+}
+
+// ---------- F. plugin-manager logs ----------
+sec('F. recent plugin-manager logs (errors only)');
+let logErrors = 0;
+for (const p of profiles) {
+  const logsDir = path.join(PROFILES_DIR, p, '.plugin-manager', 'logs');
+  const ops = safe(() => fs.readdirSync(logsDir, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => path.join(logsDir, d.name)), []);
+  ops.sort((a, b) => safe(() => fs.statSync(b).mtime - fs.statSync(a).mtime, 0));
+  for (const op of ops.slice(0, 3)) {
+    const logFile = path.join(op, 'pnpm.log');
+    if (!exists(logFile)) continue;
+    const errs = readText(logFile).split(/\r?\n/)
+      .filter((l) => /ERR_|ERESOLVE|404|EPERM|EACCES|ENOENT|failed|cannot|not found/i.test(l))
+      .filter((l) => !/ERR_PNPM_IGNORED_BUILDS|Ignored build scripts|peer dependenc/i.test(l)).slice(0, 5);
+    if (errs.length) {
+      logErrors += 1;
+      warn(p + ' / ' + path.basename(op) + ' (' + new Date(fs.statSync(op).mtime).toLocaleString() + '):');
+      for (const e of errs) L.push('        ' + e.trim().slice(0, 160));
+    }
+  }
+}
+if (!logErrors) ok('no errors in the recent plugin-manager logs');
+if (logErrors) L.push('  [INFO] ERR_PNPM_META_FETCH_FAIL for @local%2Fdsh-sac-* means the plugin panel was once asked to install it by name (that needs the internet). This kit writes a local link: dependency instead.');
+
+// ---------- G. client capabilities ----------
+sec('G. client capabilities (preset mechanism / compaction API)');
+const asarPath = findAppAsar(args.appAsar);
+const caps = clientCapabilities(asarPath);
+let presetMechanism = caps.preset, registry = null;
+if (!asarPath) {
+  warn('app.asar was not found: preset compatibility cannot be verified. Pass it explicitly, e.g. -app-asar "C:\\Program Files\\DeepSeek Harness\\resources\\app.asar"');
+  L.push('         Find it: right-click the DeepSeek Harness shortcut -> Open file location -> the "resources" folder next to it.');
+} else {
+  ok('app.asar: ' + asarPath);
+  info('CLI package @deepseek-ai/dsh ' + show(caps.dshVersion));
+  const ar = openAsar(asarPath);
+  if (ar) {
+    try { registry = !!asarNode(ar.tree, 'dsh/node_modules/@deepseek-ai/dsh-agent-preset-registry/package.json'); } finally { try { fs.closeSync(ar.fd); } catch (e) {} }
+  }
+  if (presetMechanism) ok('agent presets are supported: the "SAC" preset can be offered');
+  else { bad('this build has no agent-preset mechanism (or no standard preset to derive from): the "SAC" preset can never appear'); finding('no preset support in this client build: use the profile-wide method (-global)'); }
+  if (caps.compaction === false) { bad('compaction backend MISSING: @deepseek-ai/dsh-compaction-basic'); finding('no compaction backend in this client build'); }
+  else if (caps.compactRegion === true) ok('the compaction backend exposes compactRegion() (what the SAC plugin drives)');
+  else if (caps.compactRegion === false) { bad('the compaction backend does NOT expose compactRegion(): SAC cannot fold on this build'); finding('this build lacks compactRegion(): upgrade DeepSeek Harness'); }
+  else warn('could not inspect the compaction backend source');
+}
+
+// ---------- H. preset against this client ----------
+sec('H. the installed preset against this client');
+const target = targetMethods.join('+');
+if (target !== 'preset' && !dirs.preset) {
+  info('the preset method is not in use in the target profile');
+} else {
+  const patchFile = path.join(dirs.preset || path.join(DSH_ROOT, 'plugins', 'sac', DIR.preset), 'cordis.patch.yml');
+  if (!exists(patchFile)) bad('preset patch missing: ' + patchFile);
+  else {
+    const text = readText(patchFile);
+    const names = [];
+    for (const m of text.matchAll(/name:\s*'(@deepseek-ai\/[^']+)'/g)) if (names.indexOf(m[1]) < 0) names.push(m[1]);
+    const ar = asarPath ? openAsar(asarPath) : null;
+    if (!ar) {
+      info('app.asar unavailable: the preset\'s plugin list cannot be checked against this client');
+    } else {
+      try {
+        const missing = names.filter((n) => !asarNode(ar.tree, 'dsh/node_modules/' + n.split('/').slice(0, 2).join('/') + '/package.json'));
+        if (!names.length) warn('the preset lists no @deepseek-ai plugins (unexpected)');
+        else if (!missing.length) ok('all ' + names.length + ' plugins the preset lists exist in this client');
+        else {
+          bad(missing.length + ' of ' + names.length + ' plugins the preset lists are NOT in this client: ' + missing.slice(0, 8).join(', ') + (missing.length > 8 ? ', ...' : ''));
+          finding('the preset lists plugins this client does not ship: run the update to generate it from this client');
+        }
+        if (!caps.standardPreset) info('this client ships no readable standard preset: the installed one is used as it is');
+        else if (/generated at (install|update) time from this client/.test(text)) ok('generated from this client\'s own standard preset');
+        else warn('not generated from this client (a static patch): run the update to adapt it');
+      } finally { try { fs.closeSync(ar.fd); } catch (e) {} }
+    }
+  }
+}
+
+// ---------- I. backups ----------
+sec('I. backups made by the kit');
+const backups = path.join(DSH_ROOT, 'sac-backups');
+const list = exists(backups) ? fs.readdirSync(backups).filter((n) => exists(path.join(backups, n, 'state.json'))).sort() : [];
+if (!list.length) info('none under ' + backups);
+for (const n of list.slice(-5)) info(n);
+
+// ---------- verdict ----------
+sec('VERDICT');
+if (!FINDINGS.length) {
+  ok('the local chain is complete: version, registration, links, files, config, lockfile');
+  L.push('  If the "SAC" preset still does not show up:');
+  L.push('  1) fully QUIT and restart the client (closing the window is not enough);');
+  L.push('  2) a preset can only be chosen when CREATING a session; existing sessions cannot switch;');
+  L.push('  3) make sure the client runs the profile that registers the plugin (' + args.profile + ').');
+} else {
+  for (const f of FINDINGS) bad(f);
+  L.push('');
+  L.push('  Suggested fixes:');
+  L.push('  - old, missing or unregistered plugin, a config that is not the shipped policy, a preset that does not match');
+  L.push('    this client: run the update (update-sac.cmd / update-sac.sh) in this profile.');
+  if (presetMechanism === false) L.push('  - no preset support in this build: run the update with -global (SAC for every session of the profile).');
+  if (caps.compactRegion === false) L.push('  - no compactRegion() in this build: SAC cannot work here at all; upgrade DeepSeek Harness.');
+  L.push('  - send this whole report back for precise steps.');
+}
+finish();

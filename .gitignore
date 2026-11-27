@@ -14,3 +14,13 @@ __pycache__/
 *.pyc
 .mc/
 node_modules/
+
+# local secrets (model endpoints / keys)
+.env
+benchmarks/tau2-bench/.env
+
+# build output of tools/build_sac_deploy_kit.py (the kit is attached to GitHub Releases)
+deploy/dist/
+
+# local snapshots made by tools/sac_client_backup.py
+backup/

@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "SAC single-action compaction",
-    "description": "Agent preset sac: the standard composition plus the Single-Action Compaction policy — fold every completed action into one semantic state; active only in sessions that select this preset (1.1.0: 128K-optimized pipeline)."
+    "description": "Agent preset sac: the standard composition plus the Single-Action Compaction policy — fold only once the request has grown large enough for a fold to pay for itself, so short dialogues stay full history and long sessions collapse finished work into a semantic state; active only in sessions that select this preset (1.3.0: cost-aware folding, every user instruction pinned)."
   }
 }

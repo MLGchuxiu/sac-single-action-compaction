@@ -12,11 +12,19 @@
 | | |
 |---|---|
 | Paper | Belcak et al., *You don't need long context*, arXiv:2611.05306 (local copy: [paper.pdf](paper.pdf) / [paper.txt](paper.txt); reading notes: [docs/paper-notes.md](docs/paper-notes.md)) |
-| Plugin | [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) (v1.1.0, 48 tests) + [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md) (GUI preset) |
+| Plugin | [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) (v1.3.0, 108 tests) + [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md) (GUI preset, 7 tests) |
 | Harness | [`harness/`](harness/): model client, token accounting, tool sandbox, 5 task families, 13 state-template versions |
 | Benchmarks | Loong / SWE-bench Verified / τ²-bench ([benchmarks/](benchmarks/README.md), downloaded and verified), 4 iterations + a 128K optimization track |
 | Models tested | qwen3.7-flash, deepseek-v4.1-flash, GLM-5.3-Inner (a locally deployed GLM 5.3) |
 | Hard limits | Input cap **130,172** tokens, output cap **8,192** tokens (reproduction track) |
+
+## Latest Release: v1.3.0 (2026-11-28)
+
+> The previous published version was v1.1.0. Full changes, evidence and upgrade instructions are in [CHANGELOG.md](CHANGELOG.md) (Chinese, with an English summary).
+
+- **v1.3.0 · Cost-aware folding**: folding is triggered by the size of the request instead of the number of actions (shipped water marks: fold once the whole request exceeds "system prompt + tool schemas + 32K", down to + 16K). **A short dialogue never folds** — it sends the same requests as full history — while a long session is held near the water mark. Digests the harness can write are no longer written by a model, and model-written recaps are no longer cut off or refused. Replayed on 13 real long sessions: 2.19B → 189M tokens (−91%); a 40-record memory test was answered 120/120 in 6 of 6 runs (v1.2.0 scored 74/120 on qwen3.8-27b and re-read every file). [Report](reports/REPORT-SAC-PARETO.md)
+- **v1.2.0 · Multi-turn fix**: only the first user message used to be the task anchor, so everything the user said afterwards was folded into a summary — "the user changed the goal, the agent kept working on the first one". Every user instruction is now pinned in the context and only the work between instructions is folded. [Report](reports/REPORT-SAC-MULTITURN.md)
+- **Preset fix and offline update kit**: the GUI preset's configuration now matches the plugin's shipped configuration key for key (its sessions had silently kept the old behaviour), with a test that fails on any drift; machines without network access can use `sac-deploy-kit-v1.3.0.zip`, attached to the GitHub Release, to update or roll back.
 
 ---
 
@@ -95,7 +103,7 @@ This project's `recall` tool and `ledger` are direct implementations of that ans
 
 Three things, each independently usable:
 
-1. **Productization**: [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) — a real DeepSeek Harness plugin. It hooks `agent/pre-step` and layers SAC as a policy on top of the already-mounted compaction backend; 48 unit/integration tests green. Install it and use it in daily sessions.
+1. **Productization**: [`plugins/dsh-sac-compact`](plugins/dsh-sac-compact/README.md) — a real DeepSeek Harness plugin. It hooks `agent/pre-step` and layers SAC as a policy on top of the already-mounted compaction backend; 108 unit/integration tests green (plus 7 for the preset). Install it and use it in daily sessions.
 2. **Reproduction**: [`harness/`](harness/) — a verbatim reproduction and ablation testbed of the paper's mechanism. Hard budget of 130,172 input / 8,192 output tokens; all three regimes (FHA/EoCC/SAC) side by side; the evolution of **13 state-template versions (v1–v13)** (v10–v13 are research extensions whose validation-task data is not published).
 3. **Independent validation**: [`benchmarks/`](benchmarks/README.md) + [`reports/`](reports/BENCH-REPORT.md) — the plugin runs inside real `dsh headless` sessions and is compared against a same-model FHA baseline on Loong, SWE-bench Verified, and τ²-bench: 4 iterations plus a 128K optimization track (12 tasks × n=5). **Every number can be reproduced by scripts in this repository.**
 
@@ -121,12 +129,13 @@ The key decision: the plugin **does not implement a second compaction backend**;
 
 ### 4.2 Fold-span planning — `planSacSpan()` ([lib/sac-policy.js](plugins/dsh-sac-compact/lib/sac-policy.js))
 
-This is SAC's core algorithm, a **pure function** — input is the surface node descriptors, output is a fold span or `null`. No Cordis, session, or LLM dependencies, so it can be exhaustively unit-tested off-runtime. Four rules:
+This is SAC's core algorithm, a **pure function** — input is the surface node descriptors, output is a fold span or `null`. No Cordis, session, or LLM dependencies, so it can be exhaustively unit-tested off-runtime. Five rules:
 
-1. **Task anchor**: the span starts **after** "the first non-checkpoint user message". Everything at or before the anchor (system, the task itself) is never folded. This also means the state message written by the previous fold is **absorbed** — the new state is a merge of "old state + new action", not a stack of two states.
+1. **Instruction anchors**: every user instruction (`source.kind` `user`, or the goal plugin's `goal`) is an anchor, and a fold span lies **between** two instructions — what the user wrote is never folded (since v1.2.0; before that only the first user message was an anchor). The system prompt and the task itself are never folded. This also means the state message written by the previous fold is **absorbed** — the new state is a merge of "old state + new action", not a stack of two states.
 2. **Tool-pairing balanced cut**: the span's right end may only land on a boundary with no unanswered tool calls. The scan maintains an `openToolCalls` counter (+1 per tool call in an assistant message, −1 per tool result); only positions where it returns to zero become candidate cut points. **A tool call that has not received its reply is never folded away** — a hard correctness guarantee.
 3. **Batching and retention**: `actionsPerCompaction` controls how many complete actions each fold absorbs (1 = the paper's strict SAC, 2 = SAC-2, the optimum on our benchmarks); `keepTrailingReply` keeps a final reply without tool calls out of the span (the user-visible answer never enters the state); `keepLastObservation` keeps the newest observation raw (ends the "folded it away → re-read it" loop, at the cost of a slightly higher peak context).
 4. **Size guards and a hard safety net**: `minSpanChars` / `minSpanTokens` — rewriting the state itself costs hundreds of tokens, so folding a tiny span can end up larger; skip it. `contextBudgetTokens` — once the whole surface approaches the model window (e.g. 96K under a 128K window), **force a fold** as the last line of defense against misconfiguration.
+5. **Triggered by cost (since v1.3.0)**: under the shipped configuration a fold is triggered by the size of the whole request — above "fixed prompt + 32K", down to "fixed prompt + 16K" — and a model-written recap must free at least its own size plus 400 tokens. A short dialogue therefore never folds; zeroing the related keys restores the action-count trigger of 1.2.0.
 
 ### 4.3 Generating the semantic state: three modes
 
@@ -173,6 +182,8 @@ The paper proved "feasible"; this project answers "**how to do it well, and when
 5. **The engineering trade-off between batching and observation retention**. Strict SAC (a fold per action) costs 4.8× wall clock on SWE; `actionsPerCompaction: 2` + `keepLastObservation` brings it to 1.6× while keeping total tokens **−36%** and peak **−55%** vs FHA. The paper never explores this frequency–cost–latency trade-off surface.
 6. **Four engineering pieces for a 128K window** (v1.1.0): `stateInputLean` (state-update requests stop replaying the system prompt + 22 tool schemas, saving ≈4.8K tokens per fold measured), `trimObservationOver` (trim only oversized observations; short tool output stays verbatim), `stateMaxWords` (cap the recap — it is re-sent on every later request), `contextBudgetTokens` (force-fold near the window). Combined: 12 tasks × n=5, total tokens **−58.6%**, peak **−61%**, with weighted score even **slightly up** (§6.2).
 7. **Making the cost explicit**. The paper's Appendix C admits total tokens need not fall, but gives no "how many extra calls did we pay" comparison. The harness explicitly records `requests / actions / compactions`, turning "the duplicated labor paid for short contexts" into a measurable metric (Loong strict SAC: tokens +44% but peak 6.7K vs 29.3K — trade-offs like this are all laid out in the reports).
+8. **Instruction fidelity in multi-turn sessions** (v1.2.0). The paper's SAC assumes one task per conversation; in a real session the user keeps talking, and up to v1.1.0 every later message was folded into a summary. v1.2.0 pins every user instruction: on τ²-bench (184 tasks) all 521 follow-up user messages stayed verbatim in every model step (the old version folded 347 of them away), with no distinguishable score difference from full history (152 vs 150).
+9. **A cost model for folding** (v1.3.0). The paper does not discuss whether a fold pays for itself. Auditing 820 folds one by one showed that "fold after every two actions" loses money on a ten-step dialogue: ≈4.2K tokens spent per fold for a median 600 tokens of context, 24% refused and 24% cut off, and 27–29% repeated tool calls on the longest dialogues. v1.3.0 switches to a size trigger, a gain guard, harness-written digests and bounded, uncut recaps: on short dialogues it ties full history; on long sessions it saves 67–91% of the tokens while keeping memory intact ([CHANGELOG](CHANGELOG.md)).
 
 ## 6. Validation Results
 
@@ -219,11 +230,24 @@ Round 2 ([REPORT-2.md](reports/REPORT-2.md)) validated SAC under extreme conditi
 - **Million-token input** (a 992K-token / 1,287-file coding task): every regime solved it within **3–4K context** — more evidence that "long input ≠ long context";
 - **Real work-session replay** (raw data not in this repository): neither FHA nor EoCC can hold the 130K hard budget, **only SAC never exceeds it**; the machine command ledger lifts state fidelity from 0.19 to **0.90**.
 
+### 6.4 Multi-turn sessions and cost-aware folding (v1.2.0 / v1.3.0, 2026-11-25 – 11-27)
+
+Models: qwen3.8-27b (thinking mode) on τ², GLM-5.3-Inner on the long-range benchmarks; all in real `dsh` sessions or the official `tau2` orchestrator. Full tables, reading notes and caveats: [CHANGELOG](CHANGELOG.md) and the reports below (the reports are in Chinese).
+
+| Scenario | Full history (FHA) | SAC 1.2.0 | SAC 1.3.0 (shipped, 32K) |
+|---|---|---|---|
+| τ²-bench 36-task subset (online, 1–4 trials) | 75.0% (108/144), peak prompt 38.3K | billed tokens 1.88×, 27% repeated calls | 2 folds in 108 sessions; tokens 0.94×; score difference within the A/A noise band |
+| 40-record memory test (120 facts + a total) | 120/120; 3.28M tokens | 74/120 on qwen3.8-27b, re-read every file | **120/120 in 6 of 6 runs**; 1.08M (−67%); no repeated reads |
+| 13 real long / goal sessions (shadow replay) | 2.19B tokens | 119M tokens, 2,558 model recaps | **189M tokens (−91%)**, 503 model recaps |
+
+Reports: [REPORT-SAC-PARETO.md](reports/REPORT-SAC-PARETO.md) (v1.3.0); [REPORT-SAC-MULTITURN.md](reports/REPORT-SAC-MULTITURN.md) and [REPORT-TAU2-SAC120-MULTITURN.md](reports/REPORT-TAU2-SAC120-MULTITURN.md) (v1.2.0).
+
 ## 7. Quick Start
 
 ```bash
-# Plugin tests (48 cases)
-cd plugins/dsh-sac-compact && node --test test/sac-policy.test.js test/integration.test.js
+# Plugin unit + integration tests (108 cases); preset configuration regression (7)
+cd plugins/dsh-sac-compact && node --test test/*.test.js
+cd ../dsh-sac-preset && node --test test/*.test.js
 
 # Single cell
 python3 harness/run.py --models qwen3.7-flash --regimes sac --tasks code_edit --verbose
@@ -237,7 +261,7 @@ python3 harness/report.py results/iter1/*.jsonl --out reports/iter1.md
 cd harness && python3 -m bench.matrix --bench loong,tau2,swe --arms sac,fha --iteration iter0 --workers 6
 ```
 
-**Enable per-session in the GUI**: install [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md) (a standalone preset that only affects selected sessions) and pick "SAC 单动作压缩" when creating a session; other sessions are untouched. To verify: the session log should show `compaction/start → compaction/summary → compaction/end` and `dsh-sac-compact: folded N action(s)` lines.
+**Enable per-session in the GUI**: install [`plugins/dsh-sac-preset`](plugins/dsh-sac-preset/README.md) (a standalone preset that only affects selected sessions) and pick "SAC 单动作压缩" when creating a session; other sessions are untouched. To verify: the session log should show `compaction/start → compaction/summary → compaction/end` and `dsh-sac-compact: folded N action(s)` lines (since v1.3.0 folds are triggered by request size, so not seeing a `folded` line in a short dialogue is expected). A preset composition is fixed when a session is created: after updating, **fully quit and restart the client, then create a new session**; on other machines use the offline update kit ([CHANGELOG](CHANGELOG.md)).
 
 Install at profile level:
 
@@ -249,23 +273,27 @@ Install at profile level:
 }
 ```
 
-Recommended configuration for a 128K window (these are the current defaults, and measured optimal): `statePrompt: paper` + `actionsPerCompaction: 2` + `keepLastObservation` + `trimObservationOver: 4000` + `stateMaxWords: 400` + `stateInputLean` + `contextBudgetTokens: 96000`. All 22 options are documented in the [plugin README](plugins/dsh-sac-compact/README.md#configuration).
+Shipped configuration (v1.3.0) = the 128K tuning + cost-aware folding. 128K tuning (measured optimal, unchanged): `statePrompt: paper` + `actionsPerCompaction: 2` + `keepLastObservation` + `trimObservationOver: 4000` + `stateMaxWords: 400` + `stateInputLean` + `contextBudgetTokens: 96000`. Cost-aware folding: `foldTrigger: size`, `foldMarginTokens: 32000` (down to 16000), `foldMinGainTokens: 400`, `recapMaxRatio: 0.6`, `mechanicalFoldMaxTokens: 4000` (finished turns only). All 47 options are documented in the [plugin README](plugins/dsh-sac-compact/README.md#configuration).
 
 ## 8. Repository Layout
 
 | Path | Contents |
 |---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | **per-version changes**: the v1.2.0 multi-turn fix and v1.3.0 cost-aware folding, with evidence, upgrade and rollback instructions |
 | [`paper.pdf`](paper.pdf) / [`paper.txt`](paper.txt) | the paper and its extracted text |
-| [`plugins/dsh-sac-compact/`](plugins/dsh-sac-compact/README.md) | **the SAC plugin**: policy layer + state pipeline + 48 tests |
-| [`plugins/dsh-sac-preset/`](plugins/dsh-sac-preset/README.md) | GUI agent preset (enables SAC per session) |
+| [`plugins/dsh-sac-compact/`](plugins/dsh-sac-compact/README.md) | **the SAC plugin**: policy layer + state pipeline + 108 tests |
+| [`plugins/dsh-sac-preset/`](plugins/dsh-sac-preset/README.md) | GUI agent preset (enables SAC per session; 7 tests keep its configuration equal to the plugin's shipped one) |
+| [`plugins/dsh-tau2-bridge/`](plugins/dsh-tau2-bridge/README.md) | τ²-bench bridge plugin: lets DSH + SAC run as the agent under test inside the official orchestrator |
+| [`deploy/`](deploy/templates/README.md) / [`tools/`](tools/build_sac_deploy_kit.py) | templates, end-to-end regression and build script of the offline update kit (Windows / macOS) |
 | [`harness/sac/`](harness/sac/agent.py) | reproduction harness core (agent loop, prompts, tasks, token accounting) |
 | [`harness/bench/`](harness/bench/runner.py) | three benchmark adapters + parallel matrix runner |
+| [`harness/tau2/`](harness/tau2/) / [`harness/session_replay/`](harness/session_replay/README.md) | the official multi-turn τ² testbed; tools that replay fold policies offline from exported session logs |
 | [`benchmarks/`](benchmarks/README.md) | the paper's test sets (SWE-bench Verified 500 / τ²-bench 184 / LOONG 1,600) |
-| [`reports/`](reports/BENCH-REPORT.md) | four benchmark rounds + reproduction reports + the 128K optimization report |
-| [`docs/`](docs/paper-notes.md) | paper reading notes / version tables / benchmark methodology / ecosystem survey |
+| [`reports/`](reports/BENCH-REPORT.md) | four benchmark rounds + reproduction reports + the 128K optimization report + the multi-turn forensics + the cost-aware-folding (Pareto) report |
+| [`docs/`](docs/paper-notes.md) | paper reading notes / version tables / benchmark methodology / ecosystem survey / the multi-turn τ² test plan |
 | [`work/`](work/goal_round1/ITERATIONS.md) | per-iteration data of the 128K optimization track |
 
-Version naming note: the **plugin line** (plugin-iter0–iter6 / plugin-v9) and the **harness line** (harness-v1–v13) are two independent lines — check [docs/VERSIONS.md](docs/VERSIONS.md) before reading version numbers.
+Version naming note: the **plugin line** (plugin-iter0–iter6 / plugin-v9) and the **harness line** (harness-v1–v13) are two independent lines — check [docs/VERSIONS.md](docs/VERSIONS.md) before reading version numbers. The per-version changes of the published releases (1.1.0 / 1.2.0 / 1.3.0) are in [CHANGELOG.md](CHANGELOG.md).
 
 ## 9. Limitations
 
@@ -273,7 +301,11 @@ Version naming note: the **plugin line** (plugin-iter0–iter6 / plugin-v9) and 
 - When a single action's own observation exceeds the window, compaction cannot help; pair with an observation-pruning plugin (e.g. `dsh-compaction-tool-result-pruner`).
 - `inline` mode is unavailable on reasoning models (no text block in tool-call replies); it already falls back stickily to `paper`.
 - Strict SAC's wall-clock cost (more, smaller requests) is significant on SWE-style tasks (4.8×); SAC-2 + `keepLastObservation` brings it to 1.6× — a frequency-vs-latency trade-off, not a defect.
-- τ²-bench uses a static single-turn variant (not the official multi-turn orchestration score); SWE-bench instances are a pure-Python subset runnable in a shared venv. Methods and caveats in [docs/bench-methodology.md](docs/bench-methodology.md).
+- The τ²-bench runs in §6.1–6.3 use a static single-turn variant (not the official multi-turn orchestration score); from v1.2.0 on there are also runs on the official multi-turn orchestrator (§6.4). SWE-bench instances are a pure-Python subset runnable in a shared venv. Methods and caveats in [docs/bench-methodology.md](docs/bench-methodology.md).
+- **A known boundary in multi-turn long sessions** (v1.3.0): a model recap written in the middle of a turn is anchored on the request of that moment and does not guarantee every raw value a later question needs; on tasks that must carry many exact values for a long time the summarizer sometimes replaces the accumulated table of facts with a count, and the agent re-reads to recover (1 of 3 runs on the 80-record test), at a token cost close to full history. Wiring the existing `ledger` into the 1.3.0 policy is the next step.
+- `maxPinnedInstructions` (default 4) is not a hard cap: an archive fold waits until the old instructions are large enough to be worth a model call, so 48 of 184 τ² sessions ended with 5–9 pinned (fidelity is unaffected; the context is merely larger than "at most 4" suggests).
+- The score conclusions of v1.3.0 go only as far as "the difference from full history is within the noise band": a 36-task τ² subset with 1–4 trials per arm, and one run per SWE / LOONG cell.
+- The Windows-specific parts of the offline update kit were exercised through a simulated win32 platform, not on a real Windows machine; run `update-sac.cmd -check` first on an intranet machine.
 
 ## 10. Citation
 

@@ -1,0 +1,21 @@
+{
+  "name": "@local/dsh-tau2-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Expose the tau2-bench domain tools to a DSH agent from inside the official orchestrator: every tool call is forwarded over a local HTTP bridge to the live tau2 environment, and the domain policy is mounted as a system-prompt section.",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
