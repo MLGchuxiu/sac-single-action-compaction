@@ -24,3 +24,30 @@ deploy/dist/
 
 # local snapshots made by tools/sac_client_backup.py
 backup/
+
+# --- safety net: secrets and machine-specific files must never be committed ---
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+.credentials.yaml
+*.credentials.yaml
+*.log
+*.zip
+dsh-session-*.zip
+
+# --- private research data: deliberately kept out of this public repository ---
+docs/SESSION-SURVEY.md
+harness/assets/seal/
+harness/seal_report.py
+harness/scripted_seal_test.py
+harness/policy_sim.py
+harness/replay_probe.py
+harness/session_replay/ab_objective.py
+reports/REPORT-3-*.md
+reports/tables-seal-matrix.md
+reports/assets/centers_montage.png
+reports/assets/gt_annotated.png
